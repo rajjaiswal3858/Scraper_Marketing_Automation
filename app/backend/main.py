@@ -48,7 +48,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from . import auth, config, db, fastjson, keys, persist
-from .collector.categories import SUMMARY_FILE
+from .collector.categories import SUMMARY_FILE, parse_keywords
 from .hub import RpcError, WorkerHub, WorkerUnavailable
 
 ACTIVE = ("queued", "pending", "running", "recovering", "waiting")
@@ -440,8 +440,13 @@ async def h_config(scope, headers, client) -> Reply:
         "defaults": {"target": config.DEFAULT_TARGET,
                      "max_target": config.MAX_TARGET,
                      "target_choices": config.TARGET_CHOICES,
+                     "max_keywords": config.MAX_KEYWORDS,
+                     "daily_credit_limit": config.MAX_CREDITS_PER_IP_PER_DAY,
                      "max_queries": config.DEFAULT_MAX_QUERIES,
-                     "credits_per_query": 1 + config.PLACES_PAGES_PER_QUERY},
+                     "credits_per_query": 1 + config.PLACES_PAGES_PER_QUERY,
+                     "max_credits_per_record": config.MAX_CREDITS_PER_RECORD,
+                     "records_per_credit": config.EXPECTED_RECORDS_PER_CREDIT,
+                     "social_email_lookup": bool(config.SOCIAL_EMAIL_LOOKUP)},
         "limits": {"max_active_jobs": config.MAX_ACTIVE_JOBS,
                    "jobs_per_user": config.MAX_JOBS_PER_CLIENT},
     })
@@ -1003,7 +1008,8 @@ async def start_collect(req: CollectRequest, request: Request):
         or req.location.strip()
     args = {"client": client, "category": req.category,
             "custom_category": req.custom_category,
-            "keywords": [k for k in req.keywords.split(",") if k.strip()],
+            "keywords": parse_keywords(req.keywords, config.MAX_KEYWORDS,
+                                       config.MAX_KEYWORD_LEN),
             "location": location, "geo": geo, "target": req.target,
             "provider": req.provider, "max_queries": req.max_queries,
             "ip": ip_of(request), "serper_key": own_key}

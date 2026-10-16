@@ -13,8 +13,10 @@ FRONTEND_DIR = os.path.join(APP_DIR, "frontend")
 
 # Demo cost-control defaults (each Serper search or places page = 1 credit).
 DEFAULT_TARGET = 100
-MAX_TARGET = 2000
-TARGET_CHOICES = [20, 50, 100, 250, 500, 1000, 1500, 2000]
+MAX_TARGET = 10_000              # records one search may collect
+TARGET_CHOICES = [20, 50, 100, 250, 500, 1000, 2000, 5000, 10000]
+MAX_KEYWORDS = 25                # keywords / phrases per search
+MAX_KEYWORD_LEN = 80
 DEFAULT_MAX_QUERIES = 12
 MAX_MAX_QUERIES = 400            # large targets need hundreds of queries
 YIELD_EXHAUSTED_STREAK = 10      # stop after N consecutive zero-yield queries
@@ -231,6 +233,38 @@ PLACES_MAX_PAGE = 3              # follow-up Places pages for productive queries
 # reached; this cap is the only spend-based stop. 0 disables it. Measured
 # yield is ~2-3 valid records per credit, so 1.5 leaves ample headroom.
 MAX_CREDITS_PER_RECORD = _float_env("MAX_CREDITS_PER_RECORD", 1.5, 0.0, 20.0)
+# Typical yield shown in the page's credit estimate (measured ~2-3 above).
+EXPECTED_RECORDS_PER_CREDIT = _float_env("EXPECTED_RECORDS_PER_CREDIT", 2.5, 0.1, 20.0)
+# A firm whose website shows no email but links its own Facebook / Instagram /
+# X / LinkedIn profiles: one Serper search (1 credit) reads the email Google
+# shows for those exact profiles. 0 turns it off.
+SOCIAL_EMAIL_LOOKUP = _int_env("SOCIAL_EMAIL_LOOKUP", 1, 0, 1)
+
+# A city search that runs out of results may widen to its state's other
+# cities (they are then filed under the searched city). Off: every result
+# comes from the city that was searched.
+SEARCH_NEARBY_CITIES = _int_env("SEARCH_NEARBY_CITIES", 0, 0, 1)
+
+# Email verification of every collected address (collector/emailcheck.py):
+# format + domain mail servers always; the mailbox probe (SMTP, no email is
+# sent) only where outbound port 25 is open. EMAIL_SMTP_CHECK: auto = test
+# port 25 once and probe only if it is open (Render's free plan blocks it),
+# on = always probe, off = never probe.
+EMAIL_VERIFY = _int_env("EMAIL_VERIFY", 1, 0, 1)
+EMAIL_SMTP_CHECK = (os.environ.get("EMAIL_SMTP_CHECK", "") or "auto").strip().lower()
+# Mailbox probes in flight at once, process-wide. Kept low on purpose: many
+# probes from one address in a short time get that address blacklisted.
+EMAIL_SMTP_CONCURRENCY = _int_env("EMAIL_SMTP_CONCURRENCY", 3, 1, 16)
+EMAIL_SMTP_TIMEOUT = _float_env("EMAIL_SMTP_TIMEOUT", 10.0, 2.0, 60.0)
+# Seconds between two probes of the same mail server
+EMAIL_SMTP_HOST_INTERVAL = _float_env("EMAIL_SMTP_HOST_INTERVAL", 2.0, 0.0, 60.0)
+# Envelope sender / greeting name of the probe. Empty sender = the null
+# sender "<>" every mail server must accept (RFC 5321); no address is borrowed.
+EMAIL_VERIFY_FROM = (os.environ.get("EMAIL_VERIFY_FROM", "") or "").strip()
+EMAIL_VERIFY_HELO = (os.environ.get("EMAIL_VERIFY_HELO", "") or "").strip()
+# How long a finished run waits for checks still in progress before writing
+# the final Excel file (unfinished ones are marked "not checked")
+EMAIL_VERIFY_FINAL_WAIT = _float_env("EMAIL_VERIFY_FINAL_WAIT", 90.0, 0.0, 1800.0)
 SERPER_MAX_ATTEMPTS = _int_env("SERPER_MAX_ATTEMPTS", 4, 1, 8)  # per request
 SEARCH_RETRIES = _int_env("SEARCH_RETRIES", 2, 0, 5)  # re-queues of a failed search
 # A TIMED-OUT request may already have been billed, so it is resent at most

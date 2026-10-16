@@ -159,6 +159,38 @@ def custom_templates(name: str) -> list[str]:
     ]
 
 
+_KEYWORD_SPLIT = re.compile(r"[,;|\r\n]+")
+
+
+def parse_keywords(text: str, limit: int = 25, max_len: int = 80) -> list[str]:
+    """The user's keyword box -> distinct keywords. Separators: comma,
+    semicolon, "|" or a new line; a multi-word keyword ("business
+    development executive") stays ONE phrase. Spacing is normalized,
+    duplicates (any case) dropped, order kept."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in _KEYWORD_SPLIT.split(text or ""):
+        kw = " ".join(part.split()).strip(" .\"'")[:max_len].strip()
+        if kw and kw.lower() not in seen:
+            seen.add(kw.lower())
+            out.append(kw)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def keyword_terms(keywords: list[str]) -> list[str]:
+    """Relevance terms from the user's keywords: each whole phrase, plus its
+    meaningful words (so "business development executive" also matches a
+    page that says "business development")."""
+    terms: list[str] = []
+    for kw in keywords:
+        for t in [kw.lower()] + re.split(r"[^A-Za-z0-9+#]+", kw.lower()):
+            if len(t) >= 3 and t not in _GENERIC_WORDS and t not in terms:
+                terms.append(t)
+    return terms
+
+
 def custom_terms(name: str, keywords: list[str]) -> list[str]:
     """Relevance terms for a custom category: its meaningful words plus the
     user's keywords."""

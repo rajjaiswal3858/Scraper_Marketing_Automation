@@ -42,26 +42,26 @@ import os
 import threading
 import time
 import uuid
-from collections import OrderedDict, defaultdict, deque
+from collections import Counter, OrderedDict, defaultdict, deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from urllib.parse import urlparse
 
 from .. import config, fastjson
-from . import analysis
-from .categories import (CATEGORIES, cities_for, custom_terms, expansion_phrases,
+from . import analysis, emailcheck
+from .categories import (CATEGORIES, cities_for, custom_terms, expansion_phrases, keyword_terms,
                          search_phrases, slugify_custom)
-from .crawler import Fetcher
+from .crawler import Fetcher, social_profile
 from .credits import CreditLedger, ledger_key
 from .deduplicator import DedupRegistry
 from .discovery import TIER_HELP, DiscoveryPlanner, SearchRequest
-from .exporter import write_category_file, write_master_summary
-from .extractor import Extracted, split_address
-from .geo import expansion_geos, nearby_geos
+from .exporter import read_data_rows, write_category_file, write_master_summary
+from .extractor import Extracted, clean_emails, find_emails, split_address
+from .geo import expansion_geos, find_state, nearby_geos, state_of_city
 from .prio_pool import PriorityThreadPool
 from .normalize import clean_text, norm_domain, norm_name
 from .search import ProviderDisabled, account_limits, make_provider
-from .validator import confidence, is_aggregator, is_skip_domain, validate
+from .validator import confidence, is_aggregator, is_skip_domain, record_status, validate
 
 log = logging.getLogger("engine")
 
@@ -207,6 +207,9 @@ class StateStore:
         # caches serialized record lists / category stats keyed by them.
         self.rev = 0
         self.cat_rev: dict[str, int] = defaultdict(int)
+        # category -> records per search location (built on first use; a
+        # job's target counts only its own location's records)
+        self._loc_counts: dict[str, Counter] = {}
         self._stats_cache: tuple[int, dict] | None = None
         self._cat_stats: dict[str, tuple[int, dict]] = {}   # slug -> (cat_rev, stats)
         # In-flight Serper request dedup shared by ALL jobs: two jobs issuing
@@ -256,14 +259,34 @@ class StateStore:
         self.rev += 1
         self.cat_rev[category] += 1
 
-    def append_record(self, category: str, record: dict, limit: int) -> bool:
-        """Store one validated, deduplicated record unless the category is
-        already at `limit`. Atomic with respect to other jobs."""
+    @staticmethod
+    def location_key(label: str) -> str:
+        return " ".join((label or "").split()).casefold()
+
+    def location_count(self, category: str, loc_key: str) -> int:
+        """Records of `category` collected by searches of `loc_key` (caller
+        holds self.lock)."""
+        counts = self._loc_counts.get(category)
+        if counts is None:
+            counts = self._loc_counts[category] = Counter(
+                self.location_key(r.get("Search Location", ""))
+                for r in self.records.get(category, []))
+        return counts[loc_key]
+
+    def append_record(self, category: str, record: dict, limit: int,
+                      loc_key: str | None = None) -> bool:
+        """Store one validated, deduplicated record unless the search already
+        has `limit` records - counted for its own location when `loc_key` is
+        given (an earlier search elsewhere in the category does not count),
+        else for the whole category. Atomic with respect to other jobs."""
         with self.lock:
             recs = self.records[category]
-            if len(recs) >= limit:
+            have = len(recs) if loc_key is None else self.location_count(category, loc_key)
+            if have >= limit:
                 return False
             recs.append(record)
+            self._loc_counts.get(category, Counter())[
+                self.location_key(record.get("Search Location", ""))] += 1
             self.touch(category)
             return True
 
@@ -429,7 +452,10 @@ class StateStore:
             qprefix = f"{slug}||"
             self.done_queries = {q for q in self.done_queries
                                  if not q.startswith(qprefix)}
-            self.discovery.pop(slug, None)
+            for k in [k for k in self.discovery
+                      if k == slug or k.startswith(f"{slug}@@")]:
+                del self.discovery[k]          # planner memory of every location
+            self._loc_counts.pop(slug, None)
             self.crawled = {k: v for k, v in self.crawled.items() if v != slug}
             is_custom = slug in self.custom
             if is_custom:
@@ -548,9 +574,13 @@ class CollectionJob:
         self.keywords = [k.strip() for k in keywords if k.strip()]
         self.location = location
         self.geo = {k: (geo or {}).get(k, "").strip() for k in ("city", "state", "country")}
+        self.search_place = self._search_place()
         if category in CATEGORIES:
             self.display = CATEGORIES[category]["display"]
-            self.terms = CATEGORIES[category]["terms"]
+            # the user's keywords count as relevant too (phrase + its words)
+            self.terms = list(CATEGORIES[category]["terms"]) + [
+                t for t in keyword_terms(self.keywords)
+                if t not in CATEGORIES[category]["terms"]]
         else:  # user-defined custom category (registered in the state store)
             self.display = state.custom[category]["display"]
             self.terms = custom_terms(self.display, self.keywords)
@@ -576,8 +606,17 @@ class CollectionJob:
             self.geo["city"], self.geo["state"],
             self.geo["country"] or self.location, self.location,
             cities_for(self.geo["country"] or self.location))
-        self.extra_geos = nearby_geos(self.geo["city"], self.geo["state"],
-                                      self.geo["country"])
+        # A city search stays in its city unless SEARCH_NEARBY_CITIES is on:
+        # widening to the state's other cities would file their firms under
+        # the searched city's heading.
+        self.extra_geos = (nearby_geos(self.geo["city"], self.geo["state"],
+                                       self.geo["country"])
+                           if config.SEARCH_NEARBY_CITIES else [])
+        # This search's records / planner memory are its location's own: an
+        # earlier search elsewhere in the category is never counted toward
+        # the target, resumed, or re-run.
+        self.loc_key = StateStore.location_key(self.search_place["Search Location"])
+        self.memory_key = f"{category}@@{self.loc_key}"
 
         # pending|running|recovering|completed|stopped|exhausted|failed
         self.status = "pending"
@@ -595,6 +634,7 @@ class CollectionJob:
             "candidate_urls": 0, "unique_domains": 0, "tasks_done": 0,
             "search_results": 0, "new_results": 0, "skipped_known": 0,
             "searches_done": 0,
+            "social_lookups": 0, "social_emails": 0,
             # fault tolerance
             "search_failures": 0, "search_retries": 0, "searches_failed": 0,
             "worker_errors": 0, "abandoned_tasks": 0, "pool_restarts": 0,
@@ -606,7 +646,11 @@ class CollectionJob:
             "skipped_executed": 0, "skipped_target": 0,
             "credits_after_target": 0, "timeouts_maybe_charged": 0,
             "duplicate_results": 0,
+            "email_valid": 0, "email_risky": 0, "email_invalid": 0, "email_unknown": 0,
         }
+        # email verification runs beside the crawl (emailcheck.py)
+        self._email_pool: ThreadPoolExecutor | None = None
+        self._email_checks: list[tuple[object, dict]] = []   # (future, record)
         self._seen_ids: set[str] = set()
         self._recent_new: deque[int] = deque(maxlen=config.YIELD_EXHAUSTED_STREAK)
         self._stop_search = ""            # "", "budget"
@@ -810,8 +854,10 @@ class CollectionJob:
                 or self.category_count() >= self.target)
 
     def category_count(self) -> int:
+        """Records this search has: those of its own location in the
+        category (what its target, progress and resume are measured by)."""
         with self.state.lock:
-            return len(self.state.records[self.category])
+            return self.state.location_count(self.category, self.loc_key)
 
     # -- record plumbing ------------------------------------------------------
     def _bump(self, key: str, n: int = 1):
@@ -845,6 +891,7 @@ class CollectionJob:
         ok, reason = validate(record, from_places=bool(record.get("_cid")))
         if ok:
             record["Confidence Score"] = confidence(record, self.terms)
+            record["Record Status"] = record_status(record)
         self.timings.add("validate", time.perf_counter() - t0)
         if not ok:
             self.say(f"Rejected: {record.get('Company Name', '?')[:50]} ({reason})")
@@ -861,7 +908,7 @@ class CollectionJob:
         kind = "places" if "_cid" in record else "organic"
         record.pop("_cid", None)
         lk = record.pop("_lk", "")
-        if not self.state.append_record(self.category, record, self.target):
+        if not self.state.append_record(self.category, record, self.target, self.loc_key):
             return False
         self._last_new_record = time.time()
         self._bump("valid")
@@ -879,6 +926,7 @@ class CollectionJob:
         self.say(f"Found: {record['Company Name'][:60]}  "
                  f"email={'yes' if record.get('Business Email') else 'no'} "
                  f"phone={'yes' if record.get('Business Phone') else 'no'}")
+        self._queue_email_check(record)
         if self.status == "recovering" and self._recovery_kind != "search":
             self._recovered("", "new records are being stored again")
         return True
@@ -912,6 +960,113 @@ class CollectionJob:
         ex.services = res.get("services", "") or ""
         return ex
 
+    # -- email verification -----------------------------------------------------
+    def _queue_email_check(self, record: dict):
+        """Verify the stored record's email(s) in the background; the result
+        lands in its Email Status / Email Score / Email Check columns."""
+        if not config.EMAIL_VERIFY or not record.get("Business Email"):
+            return
+        with self.lock:
+            if self._email_pool is None:
+                self._email_pool = ThreadPoolExecutor(
+                    max_workers=config.EMAIL_SMTP_CONCURRENCY + 1,
+                    thread_name_prefix=f"email-{self.id[:6]}")
+            try:
+                fut = self._email_pool.submit(self._check_record_email, record)
+            except RuntimeError:   # pool already shut down (job ending)
+                return
+            self._email_checks.append((fut, record))
+
+    def _check_record_email(self, record: dict):
+        emails = [e.strip() for e in record.get("Business Email", "").split(";") if e.strip()]
+        verdicts = [emailcheck.verify(e) for e in emails]
+        if not verdicts:
+            return
+        fields = emailcheck.summarize(verdicts)
+        with self.state.lock:
+            record.update(fields)
+            record["Confidence Score"] = confidence(record, self.terms)
+            record["Record Status"] = record_status(record)
+            self.state.touch(self.category)
+        self._bump(f"email_{fields['Email Status'].lower()}")
+        best = max(verdicts, key=lambda v: v.score)
+        self.say(f"Email check: {best.email[:80]} -> {best.status} ({best.score}/100): "
+                 f"{best.detail[:120]}"
+                 + (f" (+{len(verdicts) - 1} other address(es) checked)" if len(verdicts) > 1 else ""))
+
+    def _wait_email_checks(self):
+        """Before the final Excel export: let running checks finish (bounded),
+        mark the rest "not checked"."""
+        with self.lock:
+            checks, pool = list(self._email_checks), self._email_pool
+        if not checks:
+            return
+        pending = [f for f, _ in checks if not f.done()]
+        if pending:
+            limit = 10.0 if self.stop_event.is_set() else config.EMAIL_VERIFY_FINAL_WAIT
+            self.say(f"Waiting for {len(pending)} email check(s) to finish "
+                     f"(up to {int(limit)}s)...")
+            wait(pending, timeout=limit)
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+        late = 0
+        with self.state.lock:
+            for fut, rec in checks:
+                if not fut.done() and not rec.get("Email Status"):
+                    rec.update({"Email Status": emailcheck.UNKNOWN, "Email Score": "",
+                                "Email Check": "not checked before the run ended"})
+                    rec["Record Status"] = record_status(rec)
+                    late += 1
+            if late:
+                self.state.touch(self.category)
+        c = self.counters
+        self.say(f"Email verification: {c['email_valid']} valid, {c['email_risky']} risky, "
+                 f"{c['email_invalid']} invalid, {c['email_unknown'] + late} unknown"
+                 + ("" if emailcheck.smtp_mode() == "off" or emailcheck.mailbox_checks_enabled()
+                    else " (mailbox step skipped: port 25 is blocked on this server)"))
+
+    def _social_email(self, socials: list[str], firm: str) -> tuple[list[str], str]:
+        """The firm's website has no email but links its own social media
+        profiles: one Serper search (1 credit) over exactly those profiles.
+        An email counts only when Google shows it for one of those profile
+        pages (or its About page) - never from a post, photo or review on it,
+        nor from another page. Returns (emails, profile URL)."""
+        p = self.provider
+        if (not config.SOCIAL_EMAIL_LOOKUP or not socials or self.done()
+                or p is None or not hasattr(p, "organic_items")):
+            return [], ""
+        if self.credit_budget and self.counters["serper_credits"] >= self.credit_budget:
+            return [], ""
+        query = " OR ".join(f"site:{s}" for s in socials) + " email"
+        self.say(f"No email on website - checking its social pages: {', '.join(socials)}")
+        try:
+            items = p.organic_items(query)
+        except Exception as exc:   # out of credits / network: skip, never fatal
+            self.say(f"Social page lookup failed for {firm[:50]}: {str(exc)[:80]}")
+            return [], ""
+        credits = int(getattr(p, "last_credits", 1) or 1)
+        self._sync_provider_counters()
+        self._bump("social_lookups")
+        self.state.ledger.record(
+            ledger_key("organic", query), kind="organic", query=query, page=1,
+            category=self.category, credits=credits, results=len(items), new=0,
+            source="api", key_source="own" if self.serper_key else "server")
+        wanted = set(socials)
+        for it in items:
+            link = str(it.get("link") or "")
+            if social_profile(link, page_only=True) not in wanted:
+                continue
+            text = " ".join(str(it.get(k) or "") for k in ("title", "snippet"))
+            attrs = it.get("attributes")
+            if isinstance(attrs, dict):
+                text += " " + " ".join(str(v) for v in attrs.values())
+            emails = clean_emails(find_emails(text[:5000]))
+            if emails:
+                self._bump("social_emails")
+                self.say(f"Email found on social page {link[:80]}: {emails[0]}")
+                return emails, link
+        return [], ""
+
     def _split_geo(self, address: str) -> tuple[str, str, str]:
         """Parse city/state/country from the address; blanks fall back to the
         user's structured location fields (the query was scoped to them)."""
@@ -920,12 +1075,27 @@ class CollectionJob:
         return (city or self.geo["city"], state_ or self.geo["state"],
                 country or self.geo["country"])
 
+    def _search_place(self) -> dict:
+        """The location the user searched (not the city of each query: a
+        state search spreads over its cities). Kept on every record so the
+        Excel file can put it in the state's sheet under its own heading.
+        Not an Excel column - the data fields stay the same."""
+        city, state_, country = self.geo["city"], self.geo["state"], self.geo["country"]
+        if state_:
+            state_ = find_state(state_, country)[1] or state_.title()
+        elif city:
+            state_ = state_of_city(city, country)
+        label = ", ".join(p for p in (city, state_, country) if p) or self.location.strip()
+        return {"Search Location": label or "Location not specified",
+                "Search State": state_, "Search Country": country or self.location.strip()}
+
     def _base_record(self, query: str) -> dict:
         return {
             "Category": self.display,
             "Subcategory": "",
             "Search Query": query,
             "Collected At": datetime.now().isoformat(timespec="seconds"),
+            **self.search_place,
         }
 
     # -- crawling -------------------------------------------------------------
@@ -985,7 +1155,9 @@ class CollectionJob:
             return candidates
 
         data = self._to_extracted(res)
+        socials = list(res.get("social") or [])
         source_page = final_url
+        email_source = final_url if data.email else ""
         # Homepage already has email + phone (+ address, unless
         # CONTACT_PAGES_FOR_ADDRESS is off): stop, no more pages. Otherwise
         # follow at most 2 contact/about links, stopping early.
@@ -999,10 +1171,18 @@ class CollectionJob:
                     continue
                 before = (bool(data.email), bool(data.phone), bool(data.address))
                 data.merge_missing(self._to_extracted(r2))
+                socials += [s for s in r2.get("social") or [] if s not in socials]
+                if data.email and not before[0]:
+                    email_source = fu2
                 if (bool(data.email), bool(data.phone), bool(data.address)) != before:
                     source_page = fu2
                 if data.email and data.phone and data.address:
                     break
+
+        if not data.email and socials:
+            emails, page = self._social_email(socials[:3], data.name or norm_domain(final_url))
+            if emails:
+                data.email, source_page, email_source = emails, page, page
 
         if not (data.phone or data.email):
             return candidates  # quality gate: a firm site has a contact channel
@@ -1014,6 +1194,7 @@ class CollectionJob:
             "Company Name": data.name or norm_domain(final_url),
             "Official Website": website,
             "Business Email": "; ".join(data.email),
+            "Email Source": email_source if data.email else "",
             "Business Phone": "; ".join(data.phone),
             "Full Business Address": data.address,
             "City": city, "State": state_, "Country": country,
@@ -1036,6 +1217,7 @@ class CollectionJob:
         website = clean_text(place.get("website"))
         cid = str(place.get("cid") or place.get("placeId") or "")
         email: list[str] = []
+        email_source = ""
         industry = clean_text(place.get("category"))
         services = industry
         site_url = ""
@@ -1051,16 +1233,25 @@ class CollectionJob:
                 else:
                     if not res.get("blocked"):
                         data = self._to_extracted(res)
+                        socials = list(res.get("social") or [])
                         source_page = final_url
+                        email_source = final_url if data.email else ""
                         # Places already supplied phone + address; only chase
-                        # the email, via at most one contact page.
+                        # the email, via at most one contact page, then the
+                        # firm's own social media profiles.
                         if not data.email:
                             for cp in (res.get("contact_links") or [])[:1]:
                                 r2, fu2, _ = self._fetch_analyze(cp, contact_links=False)
                                 if r2 is not None and not r2.get("blocked"):
                                     data.merge_missing(self._to_extracted(r2))
+                                    socials += [s for s in r2.get("social") or []
+                                                if s not in socials]
                                     if data.email:
-                                        source_page = fu2
+                                        source_page = email_source = fu2
+                        if not data.email and socials:
+                            emails, page = self._social_email(socials[:3], title)
+                            if emails:
+                                data.email, source_page, email_source = emails, page, page
                         email = data.email
                         if data.services:
                             services = f"{services} | {data.services}" if services else data.services
@@ -1073,6 +1264,7 @@ class CollectionJob:
             "Company Name": title[:150],
             "Official Website": site_url,
             "Business Email": "; ".join(email),
+            "Email Source": email_source if email else "",
             "Business Phone": clean_text(place.get("phoneNumber")),
             "Full Business Address": address,
             "City": city, "State": state_, "Country": country,
@@ -1568,7 +1760,7 @@ class CollectionJob:
             with self.state.lock:
                 self.state.jobs[self.category] = meta
                 if memory is not None:
-                    self.state.discovery[self.category] = memory
+                    self.state.discovery[self.memory_key] = memory
             if not force:
                 self.state.request_save(self.state.path, export_category=self.category)
                 return
@@ -1590,7 +1782,7 @@ class CollectionJob:
         with self.state.lock:
             legacy = {q[len(prefix):] for q in self.state.done_queries
                       if q.startswith(prefix)}
-            saved = self.state.discovery.get(self.category)
+            saved = self.state.discovery.get(self.memory_key)
         return DiscoveryPlanner(
             self.phrases, self.geos, saved=saved, legacy_done=legacy,
             places=self.provider.supports_places, max_page=config.PLACES_MAX_PAGE,
@@ -1626,7 +1818,7 @@ class CollectionJob:
                      f"dropped) | credit budget {self.credit_budget}")
             if self.category_count() > 0:
                 self.say(f"Resuming: {self.category_count()}/{self.target} records "
-                         f"already collected for this category; "
+                         f"already collected for {self.search_place['Search Location']}; "
                          f"{self.planner.pending_retries()} previously failed "
                          f"search(es) will be retried")
             self._pool = self._new_crawl_pool()
@@ -1885,9 +2077,10 @@ class CollectionJob:
         Excel export + verification, then the terminal state."""
         self._sync_provider_counters()
         with self.state.lock:
-            self.state.discovery[self.category] = self.planner.export()
+            self.state.discovery[self.memory_key] = self.planner.export()
         self._log_slowest()
         self._log_credits()
+        self._wait_email_checks()
         summary = self._finalize_outputs()
         n = self.category_count()
         credits = self.counters["serper_credits"]
@@ -1967,19 +2160,17 @@ class CollectionJob:
                 f"{dup_name} duplicate names. {export_note}")
 
     def _excel_rows(self) -> int:
-        from openpyxl import load_workbook
+        """Record rows in the category's workbook (every state sheet; the
+        location headings are not counted)."""
         path = os.path.join(self.state.out_dir,
                             self.state.all_categories()[self.category]["file"])
-        wb = load_workbook(path, read_only=True)
-        try:
-            return sum(1 for row in wb.active.iter_rows(min_row=2, values_only=True)
-                       if any(v not in (None, "") for v in row))
-        finally:
-            wb.close()
+        return len(read_data_rows(path))
 
     def _fail(self, message: str, error: str):
         """FAILED: genuinely unrecoverable; the exact reason is logged."""
         self._closed = True
+        if self._email_pool is not None:
+            self._email_pool.shutdown(wait=False, cancel_futures=True)
         self.status = "failed"
         self.error = error
         self.stop_reason = error
@@ -2152,6 +2343,7 @@ class CollectionJob:
         planner = self.planner
         snap = {
             "id": self.id,
+            "search_location": self.search_place["Search Location"],
             "created_at": self.created_at,
             "status": self.status,
             "error": self.error,

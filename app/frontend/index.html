@@ -137,6 +137,8 @@
   .adv-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-top: 14px; }
   @media (max-width: 620px) { .adv-grid { grid-template-columns: 1fr; } }
   .estimate { font-size: 12px; color: var(--ink-3); margin-top: 10px; }
+  .estimate b { color: var(--ink-2); }
+  input.bad, input.bad:focus { border-color: var(--bad); }
 
   /* ---------- buttons ---------- */
   .btn { display: inline-flex; align-items: center; justify-content: center; gap: 9px;
@@ -238,6 +240,8 @@
   .search-wrap svg { position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
                      color: var(--ink-3); pointer-events: none; }
   .search-wrap input { padding: 9px 12px 9px 36px; font-size: 13.5px; }
+  .rec-loc { width: auto; max-width: 300px; padding: 8px 10px; font-size: 13px; }
+  @media (max-width: 620px) { .rec-loc { max-width: 100%; flex: 1 1 100%; } }
   .table-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); }
@@ -624,14 +628,18 @@
 
     <div class="gap"></div>
     <div class="step"><span class="n">3</span> Keywords <span style="font-weight:400;color:var(--ink-3)">&mdash; optional</span></div>
-    <input id="keywords" placeholder="e.g. CPA, Accounting, Tax">
+    <input id="keywords" placeholder="e.g. CPA, Tax, Business development executive">
+    <div class="estimate" id="kwHint"></div>
     <div id="kwChips" class="chips"></div>
 
     <details class="adv">
       <summary><svg class="chev" width="13" height="13" viewBox="0 0 24 24"><use href="#i-chev"/></svg>
         Advanced options</summary>
       <div class="adv-grid">
-        <div><label>Target records</label><select id="target"></select></div>
+        <div><label>Target records</label>
+          <input id="target" type="number" min="1" step="1" value="100"
+                 list="targetList" inputmode="numeric" placeholder="e.g. 300">
+          <datalist id="targetList"></datalist></div>
         <div><label>Max search queries</label><input id="maxq" type="number" min="1" max="400" value="12"></div>
         <div><label>Search provider</label>
           <select id="provider"><option value="serper">Serper (Google)</option></select></div>
@@ -709,6 +717,7 @@
           <svg width="15" height="15" viewBox="0 0 24 24"><use href="#i-search"/></svg>
           <input id="recSearch" placeholder="Search results&hellip;">
         </div>
+        <select id="recLoc" class="rec-loc" title="Show the results of one search location"></select>
         <span style="margin-left:auto;font-size:12.5px;color:var(--ink-3)" id="recCount"></span>
       </div>
       <div class="table-wrap">
@@ -979,14 +988,14 @@ function renderChips() {
   wrap.innerHTML = '';
   const suggested = (selectedCat !== '__custom__' && lastPerCat && lastPerCat[selectedCat]
     && lastPerCat[selectedCat].suggested) || [];
-  const active = $('keywords').value.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  const active = parseKeywords($('keywords').value).map(s => s.toLowerCase());
   suggested.forEach(kw => {
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'chip-kw' + (active.includes(kw.toLowerCase()) ? ' on' : '');
     b.textContent = kw;
     b.onclick = () => {
-      let kws = $('keywords').value.split(',').map(s => s.trim()).filter(Boolean);
+      let kws = parseKeywords($('keywords').value);
       if (kws.some(k => k.toLowerCase() === kw.toLowerCase())) {
         kws = kws.filter(k => k.toLowerCase() !== kw.toLowerCase());
       } else {
@@ -994,6 +1003,7 @@ function renderChips() {
       }
       $('keywords').value = kws.join(', ');
       renderChips();
+      updateKeywordHint();
     };
     wrap.appendChild(b);
   });
@@ -1514,14 +1524,22 @@ async function init() {
   renderChips();
   fillDatalist('countryList', COUNTRIES);
   updateStateList();
-  const tsel = $('target');
-  tsel.innerHTML = '';
+  // Free number entry; the old preset values stay as suggestions
+  maxTarget = cfg.defaults.max_target || 2000;
+  maxCreditsPerRecord = cfg.defaults.max_credits_per_record ?? 1.5;
+  recordsPerCredit = cfg.defaults.records_per_credit || 2.5;
+  socialLookup = cfg.defaults.social_email_lookup !== false;
+  maxKeywords = cfg.defaults.max_keywords || 25;
+  dailyLimit = cfg.defaults.daily_credit_limit || 0;
+  updateKeywordHint();
+  const tlist = $('targetList');
+  tlist.innerHTML = '';
   (cfg.defaults.target_choices || [20, 50, 100, 250, 500, 1000, 1500, 2000]).forEach(v => {
     const o = document.createElement('option');
-    o.value = v; o.textContent = v.toLocaleString();
-    tsel.appendChild(o);
+    o.value = v;
+    tlist.appendChild(o);
   });
-  tsel.value = cfg.defaults.target;
+  $('target').value = cfg.defaults.target;
   $('maxq').value = cfg.defaults.max_queries;
   applyKey(cfg.serper_key);
   refreshCredits();
@@ -1657,26 +1675,86 @@ $('keyRemove').onclick = async () => {
   }
 };
 
+let maxTarget = 2000, maxCreditsPerRecord = 1.5, recordsPerCredit = 2.5, socialLookup = true;
+let maxKeywords = 25, dailyLimit = 0;
+// The typed number of records (any positive whole number), or 0
+function typedTarget() {
+  const t = Number($('target').value);
+  return Number.isInteger(t) && t >= 1 ? t : 0;
+}
+// The typed target if one search can collect it, else 0
+function targetValue() {
+  const t = typedTarget();
+  return t <= maxTarget ? t : 0;
+}
 function updateEstimate() {
   const q = Math.min(+$('maxq').value || 12, 400);
-  const t = +$('target').value || 100;
-  $('estimate').textContent =
-    `Starts with ${q} searches, then automatically adds new cities and ` +
-    `service phrases until the target is reached. Credit cap: ` +
-    `${Math.min(800, Math.max(q * creditsPerQuery, t))} Serper credits.`;
+  const t = typedTarget();
+  const over = t > maxTarget;
+  $('target').classList.toggle('bad', over || (!t && $('target').value !== ''));
+  if (!t) {
+    $('estimate').textContent = 'Enter a number of records (a whole number) to see the estimated credits.';
+    return;
+  }
+  // Same cap the engine enforces (engine.credit_budget); the typical figure
+  // uses the measured yield of valid records per credit.
+  const cap = maxCreditsPerRecord > 0
+    ? Math.max(2 * q, Math.ceil(t * maxCreditsPerRecord)) : 0;
+  let typical = Math.ceil(t / recordsPerCredit);
+  if (cap) typical = Math.min(typical, cap);
+  $('estimate').innerHTML =
+    `Estimated cost for <b>${t.toLocaleString()}</b> records: ` +
+    `<b>~${typical.toLocaleString()} Serper credits</b>` +
+    (cap ? ` (never more than <b>${cap.toLocaleString()}</b>).` : ' (no credit cap set).') +
+    (over
+      ? ` <span style="color:var(--bad)">One search can collect at most ` +
+        `${maxTarget.toLocaleString()} records &mdash; run ` +
+        `${Math.ceil(t / maxTarget)} searches of up to ` +
+        `${maxTarget.toLocaleString()} each to reach this many.</span>`
+      : ` Starts with ${q} searches, then automatically adds new cities and ` +
+        `service phrases until the target is reached.`) +
+    (socialLookup
+      ? ` When a website shows no email but links its own Facebook, Instagram, ` +
+        `X or LinkedIn page, the email is looked up there (+1 credit per such ` +
+        `business, included in the maximum).`
+      : '') +
+    // the shared demo key has a per-network daily credit limit
+    (!over && dailyLimit && cfg && cfg.serper_key && cfg.serper_key.source === 'server'
+        && typical > dailyLimit
+      ? ` <span style="color:var(--bad)">On the demo API key your network can spend ` +
+        `${dailyLimit.toLocaleString()} credits a day, so this search will pause at ` +
+        `that limit &mdash; add your own Serper key to run it in one go.</span>`
+      : '');
+}
+// The keyword box -> keywords, split like the server does: comma, semicolon,
+// "|" or new line; a multi-word phrase stays one keyword.
+function parseKeywords(text) {
+  const seen = new Set(), out = [];
+  (text || '').split(/[,;|\r\n]+/).forEach(p => {
+    const k = p.split(/\s+/).join(' ').trim();
+    if (k && !seen.has(k.toLowerCase())) { seen.add(k.toLowerCase()); out.push(k); }
+  });
+  return out.slice(0, maxKeywords);
+}
+function updateKeywordHint() {
+  const kws = parseKeywords($('keywords').value);
+  $('kwHint').textContent = kws.length
+    ? `${kws.length} keyword${kws.length === 1 ? '' : 's'}: ` + kws.map(k => `"${k}"`).join(', ')
+    : 'Separate keywords with commas. A phrase like "business development executive" stays one keyword.';
 }
 // Scale the query budget with the target (unless the user set it manually)
 // so a 100-record search doesn't run out of queries at 76 records.
 let maxqManual = false;
 $('maxq').addEventListener('input', () => { maxqManual = true; updateEstimate(); });
-$('target').addEventListener('change', () => {
-  if (!maxqManual) {
-    $('maxq').value = Math.min(400, Math.max(12, Math.ceil(+$('target').value / 6)));
+$('target').addEventListener('input', () => {
+  const t = targetValue();
+  if (t && !maxqManual) {
+    $('maxq').value = Math.min(400, Math.max(12, Math.ceil(t / 6)));
   }
   updateEstimate();
 });
 $('country').addEventListener('input', updateStateList);
-$('keywords').addEventListener('input', renderChips);
+$('keywords').addEventListener('input', () => { renderChips(); updateKeywordHint(); });
 
 /* ---------- start / stop ---------- */
 $('start').onclick = async () => {
@@ -1684,6 +1762,14 @@ $('start').onclick = async () => {
   if (isCustom && $('customName').value.trim().length < 3) {
     toast('Type a custom category name first (3+ characters)', 'warn', 'i-alert');
     $('customName').focus();
+    return;
+  }
+  if (!targetValue()) {
+    document.querySelector('details.adv').open = true;
+    toast(typedTarget()
+      ? `One search can collect at most ${maxTarget.toLocaleString()} records - lower the target to start`
+      : 'Target records must be a whole number (1 or more)', 'warn', 'i-alert');
+    $('target').focus();
     return;
   }
   $('start').disabled = true;
@@ -1695,7 +1781,7 @@ $('start').onclick = async () => {
         custom_category: $('customName').value,
         keywords: $('keywords').value,
         country: $('country').value, state: $('state').value, city: $('city').value,
-        target: +$('target').value,
+        target: targetValue(),
         provider: $('provider').value, max_queries: +$('maxq').value,
       })
     });
@@ -1866,18 +1952,19 @@ async function poll() {
   $('progIcon').firstElementChild.setAttribute('href',
     waiting ? '#i-stop' : running ? '#i-loader' : j.status === 'completed' ? '#i-check'
             : j.status === 'failed' ? '#i-x' : '#i-stop');
+  const where = j.search_location ? ` — ${j.search_location}` : '';
   $('progTitle').textContent = queued
-    ? (j.queue_position ? `Queued — #${j.queue_position} in line: ${j.category_display}`
-                        : `Starting: ${j.category_display}`)
+    ? (j.queue_position ? `Queued — #${j.queue_position} in line: ${j.category_display}${where}`
+                        : `Starting: ${j.category_display}${where}`)
     : waiting
-    ? `Paused — out of Serper credits: ${j.category_display}`
+    ? `Paused — out of Serper credits: ${j.category_display}${where}`
     : recovering
-    ? `Recovering — still collecting: ${j.category_display}`
-    : running ? `Searching: ${j.category_display}`
-    : j.status === 'completed' ? `Completed: ${j.category_display}`
-    : j.status === 'exhausted' ? `Searches exhausted: ${j.category_display}`
-    : j.status === 'stopped' ? `Stopped: ${j.category_display}`
-    : `Failed: ${j.category_display}`;
+    ? `Recovering — still collecting: ${j.category_display}${where}`
+    : running ? `Searching: ${j.category_display}${where}`
+    : j.status === 'completed' ? `Completed: ${j.category_display}${where}`
+    : j.status === 'exhausted' ? `Searches exhausted: ${j.category_display}${where}`
+    : j.status === 'stopped' ? `Stopped: ${j.category_display}${where}`
+    : `Failed: ${j.category_display}${where}`;
 
   const pct = Math.min(100, Math.round(100 * j.collected / j.target));
   $('meterFill').style.width = pct + '%';
@@ -1885,6 +1972,7 @@ async function poll() {
   setText('pPct', pct + '%');
   setText('pCollected', j.collected);
   setText('pTarget', j.target);
+  followJobLocation(j);
 
   applyLog(j);
   if (running) {
@@ -1960,7 +2048,8 @@ async function poll() {
 /* ---------- records table ---------- */
 const REC_COLS = [
   ['Company Name', 'Company'], ['Official Website', 'Website'],
-  ['Business Email', 'Email'], ['Business Phone', 'Phone'],
+  ['Record Status', 'Status'],
+  ['Business Email', 'Email'], ['Email Status', 'Email check'], ['Business Phone', 'Phone'],
   ['City', 'City'], ['Country', 'Country'],
 ];
 function buildHead() {
@@ -1985,14 +2074,47 @@ async function refreshRecords() {
     const data = await api(`/api/records?category=${encodeURIComponent(cat)}&limit=2000`);
     recordsCount[cat] = data.total;
     if (cat !== currentCat) return;
+    if (recLocCat !== cat) { recLocCat = cat; recLoc = ''; }   // another category: all
     allRecords = data.records;
     renderTable();
   } catch (e) {}
 }
+/* ---------- location filter: each search's own results ---------- */
+const EARLIER = 'Earlier results';
+let recLoc = '';                 // '' = all locations
+let recLocJob = '';              // job whose location the filter last followed
+let recLocCat = '';              // category the filter belongs to
+const locOf = r => r['Search Location'] || EARLIER;
+function buildLocFilter() {
+  const sel = $('recLoc');
+  const counts = new Map();
+  allRecords.forEach(r => counts.set(locOf(r), (counts.get(locOf(r)) || 0) + 1));
+  if (recLoc && !counts.has(recLoc)) counts.set(recLoc, 0);
+  sel.innerHTML = '';
+  const add = (value, label) => {
+    const o = document.createElement('option');
+    o.value = value; o.textContent = label; sel.appendChild(o);
+  };
+  add('', `All locations (${allRecords.length})`);
+  [...counts].forEach(([loc, n]) => add(loc, `${loc} (${n})`));
+  sel.value = recLoc;
+  sel.style.display = counts.size > 1 || recLoc ? '' : 'none';
+}
+// A new search shows its own location's results, not an earlier search's.
+function followJobLocation(j) {
+  if (!j || !j.search_location || j.id === recLocJob) return;
+  recLocJob = j.id;
+  if (j.category && j.category !== currentCat) return;
+  recLoc = j.search_location; recLocCat = currentCat; recPage = 1;
+  renderTable();
+}
+$('recLoc').addEventListener('change', () => { recLoc = $('recLoc').value; recPage = 1; renderTable(); });
+
 function renderTable() {
   buildHead();
+  buildLocFilter();
   const q = $('recSearch').value.trim().toLowerCase();
-  let rows = allRecords;
+  let rows = recLoc ? allRecords.filter(r => locOf(r) === recLoc) : allRecords;
   if (q) rows = rows.filter(r => REC_COLS.some(([k]) => String(r[k] || '').toLowerCase().includes(q)));
   const {key, dir} = recSort;
   rows = [...rows].sort((a, b) =>
@@ -2023,7 +2145,12 @@ function renderTable() {
   $('recEmpty').style.display = rows.length ? 'none' : 'block';
   $('recCount').textContent =
     `${displayNames[currentCat] || currentCat} \u2022 ${rows.length} record${rows.length === 1 ? '' : 's'}` +
-    (q ? ` (filtered from ${allRecords.length})` : '');
+    (recLoc ? ` in ${recLoc}` : '') +
+    (q || recLoc ? ` (of ${allRecords.length} in this category)` : '') +
+    ((recordsCount[currentCat] || 0) > allRecords.length
+      ? ` — showing the newest ${allRecords.length.toLocaleString()} of ` +
+        `${recordsCount[currentCat].toLocaleString()}; the Excel file has all of them`
+      : '');
   $('pageInfo').textContent = rows.length
     ? `Showing ${(recPage - 1) * PAGE_SIZE + 1}\u2013${Math.min(recPage * PAGE_SIZE, rows.length)} of ${rows.length}`
     : '';

@@ -25,7 +25,12 @@ from backend.collector.search import SearchProvider  # noqa: E402
 from bs4 import BeautifulSoup  # noqa: E402
 from openpyxl import load_workbook  # noqa: E402
 
+from backend.collector.exporter import read_data_rows  # noqa: E402
+
 engine.LIST_PAGE_MIN_EXTERNAL_LINKS = 1  # let the tiny fixture count as a list page
+# fixture domains are not real: every address "verifies" without DNS / SMTP
+from backend.collector import emailcheck  # noqa: E402
+emailcheck.verify = lambda e: emailcheck.Verdict(e, "Valid", 100, "test: mailbox exists")
 
 PAGES = {
     "http://acmetalent.example": """
@@ -59,6 +64,16 @@ PAGES = {
       <body><a href="mailto:studio@pixelforge.example">mail</a>
       <a href="tel:+918899001122">call</a>
       <address>7 Design Tower, Pune, Maharashtra 411001, India</address></body></html>""",
+    "http://coastlaw.example": """
+      <html><head><title>Coast Law Group | Corporate Law Firm</title></head>
+      <body><a href="mailto:office@coastlaw.example">mail</a>
+      <a href="tel:+16195550101">call</a>
+      <address>1 Harbor Dr, San Diego, California 92101, USA</address></body></html>""",
+    "http://baylegal.example": """
+      <html><head><title>Bay Legal Partners | Business Attorneys</title></head>
+      <body><a href="mailto:hello@baylegal.example">mail</a>
+      <a href="tel:+12135550199">call</a>
+      <address>350 S Grand Ave, Los Angeles, California 90071, USA</address></body></html>""",
 }
 
 
@@ -183,8 +198,9 @@ def planner_tests():
     print("planner tests passed")
 
 
-def run_job(state, category, keywords, organic, places, location="India", geo=None):
-    job = CollectionJob(state, category, keywords, location, 20, "serper", 4, geo=geo)
+def run_job(state, category, keywords, organic, places, location="India", geo=None,
+            target=20):
+    job = CollectionJob(state, category, keywords, location, target, "serper", 4, geo=geo)
     job.fetcher = FakeFetcher()
     real_make = engine.make_provider
     engine.make_provider = lambda *_: FakeProvider(organic, places)
@@ -255,6 +271,11 @@ def main():
     assert job.counters["failed"] >= 1, "failed URL not counted"
     acme = next(r for r in rpo if r["Company Name"] == "Acme Talent Solutions")
     assert acme["Business Email"] == "hello@acmetalent.example"
+    # provenance + credibility: where the email came from, one overall status
+    assert acme["Email Source"] == "http://acmetalent.example", acme["Email Source"]
+    assert acme["Source URL"] == "http://acmetalent.example"
+    assert acme["Email Status"] == "Valid" and acme["Record Status"] == "Verified", \
+        (acme.get("Email Status"), acme.get("Record Status"), acme.get("Confidence Score"))
     assert acme["City"] == "Mumbai" and acme["State"] == "Maharashtra" and acme["Country"] == "India"
     assert acme["Category"] == "RPO" and int(acme["Confidence Score"]) >= 70
     vertex = next(r for r in rpo if r["Company Name"] == "Vertex RPO Services")
@@ -275,13 +296,12 @@ def main():
 
     # Excel outputs: separate files, no category mixing, summary present.
     rpo_wb = load_workbook(os.path.join(config.OUTPUT_DIR, "07_RPO.xlsx"))
-    rows = list(rpo_wb.active.iter_rows(min_row=2, values_only=True))
+    rows = read_data_rows(os.path.join(config.OUTPUT_DIR, "07_RPO.xlsx"))
     header = [c.value for c in rpo_wb.active[1]]
     assert header[0] == "Company Name" and "Confidence Score" in header
     assert len(rows) == len(rpo) and all(r[1] == "RPO" for r in rows)
     from backend.collector.categories import CATEGORIES
-    threed_wb = load_workbook(os.path.join(config.OUTPUT_DIR, "09_3D_Studios.xlsx"))
-    trows = list(threed_wb.active.iter_rows(min_row=2, values_only=True))
+    trows = read_data_rows(os.path.join(config.OUTPUT_DIR, "09_3D_Studios.xlsx"))
     threed_display = CATEGORIES["3D_Studios"]["display"]
     assert all(r[1] == threed_display for r in trows) and len(trows) == len(threed)
     assert os.path.exists(os.path.join(config.OUTPUT_DIR, "00_Master_Summary.xlsx"))
@@ -301,8 +321,78 @@ def main():
     assert int(cyber[0]["Confidence Score"]) >= 70, "custom terms not matched"
     cfile = state.all_categories()[slug]["file"]
     cyber_wb = load_workbook(os.path.join(config.OUTPUT_DIR, cfile))
-    crows = list(cyber_wb.active.iter_rows(min_row=2, values_only=True))
+    crows = read_data_rows(os.path.join(config.OUTPUT_DIR, cfile))
     assert len(crows) == 1 and crows[0][1] == "Cybersecurity companies"
+    # location layout: the state's sheet, a heading for the searched city
+    assert cyber_wb.sheetnames == ["California"], cyber_wb.sheetnames
+    assert cyber_wb.active["A2"].value.startswith(
+        "Search location: Los Angeles, California, USA"), cyber_wb.active["A2"].value
+    assert cyber[0]["Search Location"] == "Los Angeles, California, USA"
+
+    # State search, then a city search in that state: the city's NEW firms are
+    # appended below the state's results in the same sheet; a firm both
+    # searches find is stored once; the state's records stay as they were.
+    usa_ca = {"city": "", "state": "california", "country": "USA"}   # typed lower-case
+    jca = run_job(state, "Law_Firms", [], ["http://coastlaw.example"], [],
+                  location="California, USA", geo=usa_ca)
+    assert jca.status == "exhausted", jca.error
+    before = [dict(r) for r in state.records["Law_Firms"]]
+    assert [r["Company Name"] for r in before] == ["Coast Law Group"], before
+    jla = run_job(state, "Law_Firms", [], ["http://coastlaw.example", "http://baylegal.example"], [],
+                  location="Los Angeles, California, USA",
+                  geo={"city": "Los Angeles", "state": "CA", "country": "USA"})
+    assert jla.status == "exhausted", jla.error
+    law = state.records["Law_Firms"]
+    assert [r["Company Name"] for r in law] == ["Coast Law Group", "Bay Legal Partners"],         [r["Company Name"] for r in law]
+    assert law[0] == before[0], "the state search's record was altered"
+    lwb = load_workbook(os.path.join(config.OUTPUT_DIR, "05_Law_Firms.xlsx"))
+    assert lwb.sheetnames == ["California"], lwb.sheetnames
+    col_a = [r[0] for r in lwb["California"].iter_rows(values_only=True)]
+    assert col_a == ["Company Name",
+                     "Search location: California, USA   (1 record)", "Coast Law Group", None,
+                     "Search location: Los Angeles, California, USA   (1 record)",
+                     "Bay Legal Partners"], col_a
+    print("  state then city search: city appended under its own heading, duplicate skipped")
+
+    # A NEW location in the same category is a new search: its target counts
+    # only its own records (New Delhi's 2 must not "complete" a Prayagraj run
+    # of 2), it fetches fresh results, and a firm already found is not re-added.
+    def hosp(cid, title, area, city, st, pin):
+        n = {"d1": 1, "d2": 2, "p1": 3, "p2": 4}[cid]
+        return {"title": title, "phoneNumber": f"+91 98{n}00 1234{n}", "cid": cid,
+                "address": f"{area}, {city}, {st} {pin}, India", "category": "Hospital"}
+    hs = state.ensure_custom("Hospitals")
+    delhi = [hosp("d1", "Apex Heart Hospital", "Saket", "New Delhi", "Delhi", "110017"),
+             hosp("d2", "Lotus Multispeciality Hospital", "Dwarka", "New Delhi", "Delhi", "110075")]
+    jd = run_job(state, hs, [], [], delhi, location="New Delhi, India",
+                 geo={"city": "New Delhi", "state": "", "country": "India"}, target=2)
+    assert jd.status == "completed" and jd.category_count() == 2, (jd.status, jd.error)
+    prayag = [delhi[0],                      # a Delhi hospital again: duplicate
+              hosp("p1", "Sangam City Hospital", "Civil Lines", "Prayagraj", "Uttar Pradesh", "211001"),
+              hosp("p2", "Triveni Hospital", "George Town", "Prayagraj", "Uttar Pradesh", "211002")]
+    jp = run_job(state, hs, [], [], prayag, location="Prayagraj, Uttar Pradesh, India",
+                 geo={"city": "Prayagraj", "state": "Uttar Pradesh", "country": "India"}, target=2)
+    assert jp.status == "completed", (jp.status, jp.error, jp.stop_reason)
+    assert jp.counters["searches_done"] > 0, "the Prayagraj search must actually search"
+    hrecs = state.records[hs]
+    by_loc = {}
+    for r in hrecs:
+        by_loc.setdefault(r["Search Location"], []).append(r["Company Name"])
+    assert by_loc == {"New Delhi, Delhi, India": ["Apex Heart Hospital", "Lotus Multispeciality Hospital"],
+                      "Prayagraj, Uttar Pradesh, India": ["Sangam City Hospital", "Triveni Hospital"]}, by_loc
+    assert jp.category_count() == 2 and jp.snapshot(False)["collected"] == 2
+    assert jp.snapshot(False)["search_location"] == "Prayagraj, Uttar Pradesh, India"
+    mem = {k for k in state.discovery if k.startswith(hs)}
+    assert mem == {f"{hs}@@new delhi, delhi, india", f"{hs}@@prayagraj, uttar pradesh, india"}, mem
+    hfile = os.path.join(config.OUTPUT_DIR, state.all_categories()[hs]["file"])
+    hwb = load_workbook(hfile)
+    assert hwb.sheetnames == ["Delhi", "Uttar Pradesh"], hwb.sheetnames
+    assert hwb["Delhi"]["A2"].value.startswith("Search location: New Delhi, Delhi, India   (2 records)")
+    assert hwb["Uttar Pradesh"]["A2"].value.startswith(
+        "Search location: Prayagraj, Uttar Pradesh, India   (2 records)")
+    assert len(read_data_rows(hfile)) == 4
+    print("  New Delhi then Prayagraj: fresh Prayagraj results, own target, own heading, "
+          "duplicate skipped, New Delhi kept")
 
     # Checkpoint/resume: reload state from disk and confirm nothing is lost.
     reloaded = StateStore.load(config.STATE_PATH)

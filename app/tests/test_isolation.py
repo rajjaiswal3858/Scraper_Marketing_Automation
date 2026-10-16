@@ -124,10 +124,16 @@ def main():
         with urllib.request.urlopen(r, timeout=60) as resp:
             blob = resp.read()
             assert "spreadsheetml" in resp.headers["Content-Type"], resp.headers
-        import io
-        from openpyxl import load_workbook
-        ws = load_workbook(io.BytesIO(blob)).active
-        assert ws.max_row - 1 == 20, ws.max_row
+        import tempfile
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from backend.collector.exporter import read_data_rows
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tf:
+            tf.write(blob)
+        try:
+            n = len(read_data_rows(tf.name))    # all sheets, headings not counted
+        finally:
+            os.remove(tf.name)
+        assert n == 20, n
         print(f"  download {adv}: valid workbook with all 20 records: OK")
 
         # -- jobs per network, with a new client id every time -----------------------

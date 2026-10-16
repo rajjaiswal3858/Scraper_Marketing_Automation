@@ -159,6 +159,27 @@ def _format_ld_address(addr) -> str:
 LD_JSON_RE = re.compile(r"ld\+json", re.I)
 
 
+def json_ld_same_as(doc) -> list[str]:
+    """URLs a page's JSON-LD declares as the organization's own profiles
+    ("sameAs": [facebook, instagram, ...])."""
+    out: list[str] = []
+    for script in dom.scripts_with_type(doc):
+        if not LD_JSON_RE.search(script.get("type") or ""):
+            continue
+        try:
+            data = json.loads((script.text or "").strip())
+        except Exception:
+            continue
+        for obj in _iter_ld(data):
+            same = obj.get("sameAs")
+            for u in (same if isinstance(same, list) else [same]):
+                if isinstance(u, str) and u.startswith("http") and u not in out:
+                    out.append(u)
+            if len(out) >= 40:
+                return out
+    return out
+
+
 def parse_json_ld(doc) -> dict:
     out: dict = {}
     for script in dom.scripts_with_type(doc):
@@ -215,6 +236,12 @@ def extract_emails(doc, text: str, raw_html: str) -> list[str]:
         found.extend(EMAIL_RE.findall(addr[:500]))
     found.extend(find_emails(text[:MAX_SCAN_CHARS]))
     found.extend(find_emails(raw_html[:MAX_SCAN_CHARS]))
+    return clean_emails(found)
+
+
+def clean_emails(found: list[str]) -> list[str]:
+    """Lower-cased, de-duplicated, junk (image names, placeholders, no-reply)
+    removed; at most 3."""
     out: list[str] = []
     for e in found:
         e = e.strip(".-_").lower()

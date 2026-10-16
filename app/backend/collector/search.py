@@ -334,6 +334,13 @@ class SerperProvider(SearchProvider):
                 urls.append(link)
         return urls[:max_results]
 
+    def organic_items(self, query: str) -> list[dict]:
+        """One page of full organic results (title, link, snippet, ...) -
+        exactly ONE credit. Used to read emails Google shows for a firm's
+        social media profiles."""
+        data = self._post(self.SEARCH_URL, {"q": query, "num": 10})
+        return [i for i in data.get("organic") or [] if isinstance(i, dict)]
+
     ACCOUNT_URL = "https://google.serper.dev/account"
 
     def balance(self) -> int | None:

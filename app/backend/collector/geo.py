@@ -175,6 +175,17 @@ def find_state(state: str, country: str) -> tuple[str, str, list[str]]:
     return "", "", []
 
 
+def state_of_city(city: str, country: str) -> str:
+    """The state whose city list contains `city` ("" if not listed)."""
+    ckey = _country_key(country)
+    order = [ckey] if ckey in STATE_CITIES else list(STATE_CITIES)
+    for ck in order:
+        for name, cs in STATE_CITIES[ck].items():
+            if any(c.lower() == (city or "").strip().lower() for c in cs):
+                return name
+    return ""
+
+
 def nearby_geos(city: str, state: str, country: str) -> list[str]:
     """Extra locations for the planner's "expanded" tier (used only after the
     base locations are exhausted). A pinned city widens to the other cities

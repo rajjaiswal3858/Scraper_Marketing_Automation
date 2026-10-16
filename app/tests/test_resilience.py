@@ -311,14 +311,9 @@ def check_records(state, category, expected):
 
 
 def excel_rows(state, category) -> int:
-    from openpyxl import load_workbook
+    from backend.collector.exporter import read_data_rows
     path = os.path.join(config.OUTPUT_DIR, state.all_categories()[category]["file"])
-    wb = load_workbook(path, read_only=True)
-    try:
-        return sum(1 for row in wb.active.iter_rows(min_row=2, values_only=True)
-                   if any(v not in (None, "") for v in row))
-    finally:
-        wb.close()
+    return len(read_data_rows(path))
 
 
 def report(name, job, mon, t):
@@ -480,7 +475,8 @@ def test_crash_and_resume():
     resumed_from = len(state_b.records["Recruitment"])
     before = {norm_domain(r["Official Website"]) or r["Company Name"]
               for r in state_b.records["Recruitment"]}
-    used_before = set(state_b.discovery["Recruitment"]["used"])
+    # planner memory is kept per searched location (same location = resume)
+    used_before = set(state_b.discovery[job_a.memory_key]["used"])
     provider_b = SimProvider(world, outage=(30, 40))
     job_b = make_job(state_b, world, 2000, provider_b, SimFetcher(world))
     issued_keys: list[str] = []

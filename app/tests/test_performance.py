@@ -71,13 +71,18 @@ def test_excel_only_when_changed():
     recs.append(rec(50))
     exporter.write_category_file("Test", "01_Test.xlsx", recs, d)
     assert os.stat(path).st_mtime_ns != st2.st_mtime_ns, "new rows must be written"
-    ws = load_workbook(path).active
-    assert ws.max_row == 52 and ws.cell(row=52, column=1).value == "Firm 50"
+    rows = exporter.read_data_rows(path)
+    assert len(rows) == 51 and rows[-1][0] == "Firm 50"
     os.remove(path)                                  # e.g. deleted by hand
     exporter.write_category_file("Test", "01_Test.xlsx", recs, d)
     assert os.path.exists(path), "a removed file must be regenerated"
     exporter.write_category_file("Renamed", "01_Test.xlsx", recs, d)
     assert load_workbook(path).active.title == "Renamed", "sheet title is content"
+    recs[0] = dict(recs[0], **{"Search Location": "Austin, Texas, USA", "Search State": "Texas"})
+    st3 = os.stat(path)
+    time.sleep(0.05)
+    exporter.write_category_file("Renamed", "01_Test.xlsx", recs, d)
+    assert os.stat(path).st_mtime_ns != st3.st_mtime_ns, "a new search location is content"
 
     cats = {"Test": {"display": "Test", "file": "01_Test.xlsx"}}
     stats = {"Test": {"discovered": 60, "duplicates": 3, "failed_urls": 2}}

@@ -26,9 +26,10 @@ log = logging.getLogger("exporter")
 
 COLUMNS = [
     "Company Name", "Category", "Subcategory", "Official Website",
-    "Business Email", "Business Phone", "Country", "State", "City",
+    "Business Email", "Email Status", "Email Score", "Email Check", "Email Source",
+    "Business Phone", "Country", "State", "City",
     "Full Business Address", "Industry", "Services", "Source URL",
-    "Source Page", "Search Query", "Collected At", "Confidence Score",
+    "Source Page", "Search Query", "Collected At", "Confidence Score", "Record Status",
 ]
 
 HEADER_FILL = PatternFill("solid", fgColor="1F4E5F")
@@ -128,9 +129,10 @@ def _typed(row: list[str]) -> list:
     real date, missing values as truly empty cells (an "" cell would count
     in COUNTA). Every other cell stays a plain string."""
     out = [v if v != "" else None for v in row]
-    score = out[_COL["Confidence Score"]]
-    if score and score.isdigit():
-        out[_COL["Confidence Score"]] = int(score)
+    for col in ("Confidence Score", "Email Score"):
+        score = out[_COL[col]]
+        if score and score.isdigit():
+            out[_COL[col]] = int(score)
     when = out[_COL["Collected At"]]
     if when:
         try:
@@ -145,25 +147,114 @@ def _link(cell, target: str):
     cell.font = _LINK_FONT
 
 
-def write_category_file(display: str, fname: str, records: list[dict],
-                        out_dir: str, force: bool = False) -> str:
-    """One category's workbook. Skipped when its rows are unchanged since
-    this process last wrote the file (unless force)."""
-    os.makedirs(out_dir, exist_ok=True)
-    title = re.sub(r"[\[\]:*?/\\]", "-", display)[:31]
-    rows = [[xlsx_safe(r.get(col, "")) for col in COLUMNS] for r in records]
+# -- location layout -----------------------------------------------------------
+# One sheet per searched state (or country, when no state was searched); in
+# it, one heading row per searched location, in the order the locations were
+# first searched - so a city search lands below the state's earlier results.
+# Records keep their stored order inside a section; nothing is re-sorted.
+SECTION_PREFIX = "Search location: "
+EARLIER_SECTION = "Earlier results (collected before location headings)"
+SECTION_FILL = PatternFill("solid", fgColor="D9EAF0")
+SECTION_FONT = Font(color="1F4E5F", bold=True, size=12)
 
-    def build() -> Workbook:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = title
-        ws.append(COLUMNS)
+
+def _legacy_state(query: str) -> str:
+    """State named by an older record's search query ("... in Houston, Texas",
+    "... in Texas, USA"), or "". A bare place ("New York") is ambiguous -
+    city or state - so it is not guessed."""
+    from .geo import find_state
+    loc = query.rpartition(" in ")[2] if " in " in query else ""
+    parts = [p.strip() for p in loc.split(",") if p.strip()]
+    if len(parts) < 2:
+        return ""
+    first = find_state(parts[0], parts[-1])[1]
+    if first and len(parts) == 2:          # "Texas, USA"
+        return first
+    for p in parts[1:]:                     # "Houston, Texas[, USA]"
+        name = find_state(p, parts[-1])[1]
+        if name:
+            return name
+    return ""
+
+
+LEGACY_MAX_STATES = 3          # older records naming more states = a country search
+LEGACY_MAX_UNNAMED = 0.10      # ... or this share naming none
+
+
+def _legacy_states(records: list[dict]) -> dict[int, str]:
+    """Sheet state of each older (untagged) record, by index - only when
+    those records look like state searches. Measured on real data: a state
+    search names its state in 95-100% of its queries; a country-wide search
+    spreads over 10-50 states and many bare city names, and is then kept
+    together in one sheet, like a new country-wide search."""
+    found = {i: _legacy_state(r.get("Search Query") or "")
+             for i, r in enumerate(records) if not (r.get("Search Location") or "").strip()}
+    if not found:
+        return {}
+    named = {s for s in found.values() if s}
+    unnamed = sum(1 for s in found.values() if not s) / len(found)
+    if len(named) > LEGACY_MAX_STATES or unnamed > LEGACY_MAX_UNNAMED:
+        return {}
+    return {i: s for i, s in found.items() if s}
+
+
+def _placement(r: dict, legacy_state: str, default_sheet: str) -> tuple[str, str]:
+    """(sheet, section heading) of one record."""
+    loc = (r.get("Search Location") or "").strip()
+    if loc:
+        sheet = (r.get("Search State") or r.get("Search Country") or default_sheet).strip()
+        return sheet or default_sheet, loc
+    return legacy_state or default_sheet, EARLIER_SECTION
+
+
+def _sheet_title(name: str, used: set[str]) -> str:
+    base = re.sub(r"[\[\]:*?/\\]", "-", name).strip("' ")[:31] or "Results"
+    title, n = base, 2
+    while title.lower() in used:
+        suffix = f" ({n})"
+        title, n = base[:31 - len(suffix)] + suffix, n + 1
+    used.add(title.lower())
+    return title
+
+
+def _layout(records: list[dict], display: str) -> list[tuple[str, list[tuple[str, list[list[str]]]]]]:
+    """[(sheet title, [(section heading, rows)])], all in first-seen order."""
+    sheets: dict[str, dict[str, tuple[str, list]]] = {}
+    names: dict[str, str] = {}
+    legacy = _legacy_states(records)
+    for i, r in enumerate(records):
+        sheet, section = _placement(r, legacy.get(i, ""), display)
+        skey = sheet.lower()
+        names.setdefault(skey, sheet)
+        secs = sheets.setdefault(skey, {})
+        sec = secs.setdefault(section.lower(), (section, []))
+        sec[1].append([xlsx_safe(r.get(col, "")) for col in COLUMNS])
+    used: set[str] = set()
+    out = [(_sheet_title(names[k], used), list(secs.values())) for k, secs in sheets.items()]
+    return out or [(_sheet_title(display, used), [])]
+
+
+def _fill_sheet(ws, sections: list[tuple[str, list[list[str]]]]):
+    ws.append(COLUMNS)
+    url_cols = [_COL[c] + 1 for c in ("Official Website", "Email Source", "Source URL",
+                                      "Source Page")]
+    email_col = _COL["Business Email"] + 1
+    date_col = _COL["Collected At"] + 1
+    ncol = len(COLUMNS)
+    for i, (heading, rows) in enumerate(sections):
+        if i:
+            ws.append([])                       # spacer between searches
+        ws.append([f"{SECTION_PREFIX}{heading}   ({len(rows)} record"
+                   f"{'' if len(rows) == 1 else 's'})"])
+        hr = ws.max_row
+        ws.merge_cells(start_row=hr, start_column=1, end_row=hr, end_column=ncol)
+        cell = ws.cell(row=hr, column=1)
+        cell.fill, cell.font = SECTION_FILL, SECTION_FONT
+        cell.alignment = Alignment(vertical="center")
+        ws.row_dimensions[hr].height = 20
         for row in rows:
             ws.append(_typed(row))
-        url_cols = [_COL[c] + 1 for c in ("Official Website", "Source URL", "Source Page")]
-        email_col = _COL["Business Email"] + 1
-        date_col = _COL["Collected At"] + 1
-        for r in range(2, ws.max_row + 1):
+            r = ws.max_row
             for c in url_cols:
                 cell = ws.cell(row=r, column=c)
                 if isinstance(cell.value, str) and cell.value.startswith(("http://", "https://")):
@@ -172,12 +263,50 @@ def write_category_file(display: str, fname: str, records: list[dict],
             if isinstance(cell.value, str) and _EMAIL_RE.fullmatch(cell.value):
                 _link(cell, "mailto:" + cell.value)
             ws.cell(row=r, column=date_col).number_format = "yyyy-mm-dd hh:mm"
-        _style_sheet(ws, len(COLUMNS))
-        ws.column_dimensions[get_column_letter(date_col)].width = 18
-        ws.auto_filter.ref = ws.dimensions       # filter / sort arrows on the header
+    _style_sheet(ws, ncol)
+    ws.column_dimensions["A"].width = max(ws.column_dimensions["A"].width or 12, 30)
+    ws.column_dimensions[get_column_letter(date_col)].width = 18
+    ws.auto_filter.ref = ws.dimensions       # filter arrows on the header
+
+
+def write_category_file(display: str, fname: str, records: list[dict],
+                        out_dir: str, force: bool = False) -> str:
+    """One category's workbook: a sheet per searched state, a heading per
+    searched location. Skipped when its content is unchanged since this
+    process last wrote the file (unless force)."""
+    os.makedirs(out_dir, exist_ok=True)
+    layout = _layout(records, display)
+
+    def build() -> Workbook:
+        wb = Workbook()
+        for i, (title, sections) in enumerate(layout):
+            ws = wb.active if i == 0 else wb.create_sheet()
+            ws.title = title
+            _fill_sheet(ws, sections)
         return wb
-    _write_if_changed(os.path.join(out_dir, fname), _digest(title, rows), build, force)
+    _write_if_changed(os.path.join(out_dir, fname), _digest(layout), build, force)
     return fname
+
+
+def is_data_row(row) -> bool:
+    """A record row (not the column header, a location heading or a spacer)."""
+    first = row[0] if row else None
+    if isinstance(first, str) and first.startswith(SECTION_PREFIX):
+        return False
+    if first == COLUMNS[0] and len(row) > 1 and row[1] == COLUMNS[1]:
+        return False
+    return any(v not in (None, "") for v in row)
+
+
+def read_data_rows(path: str) -> list[tuple]:
+    """Every record row of a category workbook, all sheets, in order."""
+    from openpyxl import load_workbook
+    wb = load_workbook(path, read_only=True)
+    try:
+        return [row for ws in wb.worksheets
+                for row in ws.iter_rows(min_row=2, values_only=True) if is_data_row(row)]
+    finally:
+        wb.close()
 
 
 SUMMARY_COLS = [

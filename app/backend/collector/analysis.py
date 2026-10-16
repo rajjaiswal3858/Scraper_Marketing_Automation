@@ -22,7 +22,7 @@ from concurrent.futures.process import BrokenProcessPool
 
 from .. import config
 from . import dom
-from .crawler import external_links, find_contact_links
+from .crawler import external_links, find_contact_links, social_links
 from .extractor import extract_company
 from .normalize import clean_text
 from .validator import BLOCK_TITLE_RE, is_skip_domain
@@ -58,7 +58,8 @@ def analyze_html(raw: bytes, url: str, extract: bool, contact_links: bool,
         t1 = time.perf_counter()
         ex = extract_company(doc, raw.decode("utf-8", "replace"), url)
         out.update(name=ex.name, email=ex.email, phone=ex.phone,
-                   address=ex.address, services=ex.services)
+                   address=ex.address, services=ex.services,
+                   social=social_links(doc, url))
         out["extract_s"] = time.perf_counter() - t1
     if contact_links:
         out["contact_links"] = find_contact_links(doc, url)[:3]

@@ -132,12 +132,24 @@ def validate(record: dict, from_places: bool) -> tuple[bool, str]:
     return True, ""
 
 
+def _email_points(record: dict) -> float:
+    """20 for an email; once it has been verified, scaled by its Email Score
+    (a confirmed mailbox keeps all 20, a dead address keeps almost none)."""
+    if not record.get("Business Email"):
+        return 0
+    try:
+        return 20 * max(0, min(100, int(record.get("Email Score")))) / 100
+    except (TypeError, ValueError):   # not verified (yet / turned off)
+        return 20
+
+
 def confidence(record: dict, terms: list[str]) -> int:
+    """Credibility 0-100: website 25, email 20 (scaled by its verification),
+    phone 20, address 15, a real company name 10, matches the search 10."""
     score = 0
     if record.get("Official Website"):
         score += 25
-    if record.get("Business Email"):
-        score += 20
+    score += _email_points(record)
     if record.get("Business Phone"):
         score += 20
     if record.get("Full Business Address"):
@@ -148,4 +160,28 @@ def confidence(record: dict, terms: list[str]) -> int:
     if relevance(terms, name, record.get("Services", ""),
                  record.get("Industry", ""), record.get("Search Query", "")):
         score += 10
-    return min(score, 100)
+    return min(round(score), 100)
+
+
+VERIFIED, LIKELY, REVIEW, LOW = "Verified", "Likely valid", "Needs review", "Low quality"
+
+
+def record_status(record: dict) -> str:
+    """One overall verdict per record, from its credibility score and its
+    email check:
+      Verified      80+ and the mailbox is confirmed to exist
+      Likely valid  70+ (most details present, nothing disproved)
+      Needs review  50-69, or its email was proven invalid
+      Low quality   below 50"""
+    try:
+        score = int(record.get("Confidence Score") or 0)
+    except (TypeError, ValueError):
+        score = 0
+    email = record.get("Email Status", "")
+    if email == "Invalid":
+        return REVIEW
+    if score >= 80 and email == "Valid":
+        return VERIFIED
+    if score >= 70:
+        return LIKELY
+    return REVIEW if score >= 50 else LOW

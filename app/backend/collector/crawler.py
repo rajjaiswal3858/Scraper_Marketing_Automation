@@ -18,6 +18,7 @@ from urllib3.util.retry import Retry
 from .. import config
 from . import dom
 from ..config import FETCH_TIMEOUT
+from .extractor import json_ld_same_as
 from .normalize import root_domain
 from .ssrf import url_block_reason
 from .tls import SharedTLSAdapter
@@ -254,6 +255,90 @@ def find_contact_links(doc, base_url: str) -> list[str]:
             out.append(full)
     out.sort(key=lambda u: 0 if "contact" in u.lower() else 1)
     return out
+
+
+SOCIAL_HOSTS = {"facebook.com": "facebook.com", "fb.com": "facebook.com",
+                "instagram.com": "instagram.com", "twitter.com": "x.com",
+                "x.com": "x.com", "linkedin.com": "linkedin.com"}
+# first path parts that are share buttons, posts or site pages, never a profile
+SOCIAL_NOT_PROFILE = {
+    "sharer", "sharer.php", "share", "share.php", "dialog", "plugins", "tr",
+    "login", "login.php", "help", "policies", "privacy", "legal", "terms",
+    "pages", "profile.php", "groups", "events", "watch", "hashtag", "search",
+    "p", "reel", "reels", "explore", "stories", "accounts", "tv", "intent",
+    "home", "i", "shareArticle", "sharing", "feed", "posts", "photo.php",
+    "permalink.php", "story.php", "people", "public", "wix", "squarespace",
+    "wordpress", "godaddy", "shopify", "facebook", "instagram", "twitter",
+    "linkedin", "x",
+}
+SOCIAL_HANDLE_RE = re.compile(r"^[A-Za-z0-9._\-]{2,80}$")
+MAX_SOCIAL_PROFILES = 3
+
+
+SOCIAL_ABOUT_PAGES = {"about", "about_contact_and_basic_info", "about_details"}
+
+
+def social_profile(url: str, page_only: bool = False) -> str:
+    """Canonical "host/handle" of a social media profile URL ("facebook.com/acme",
+    "linkedin.com/company/acme"), or "" for share links and anything that is
+    not a profile. page_only: also "" for anything below the profile except its
+    About page - posts, photos and reviews there are written by other people."""
+    try:
+        p = urlparse(url.strip())
+    except ValueError:
+        return ""
+    host = p.netloc.lower().split(":")[0]
+    for prefix in ("www.", "m.", "mobile.", "web.", "business.", "en-gb.", "uk."):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+    site = SOCIAL_HOSTS.get(host)
+    if not site:
+        return ""
+    parts = [s for s in p.path.split("/") if s]
+    if site == "linkedin.com":
+        if len(parts) < 2 or parts[0].lower() not in ("company", "in", "school"):
+            return ""
+        prefix, parts = parts[0].lower() + "/", parts[1:]
+    else:
+        prefix = ""
+    if not parts:
+        return ""
+    handle = parts[0].lstrip("@")
+    if (handle.lower() in {s.lower() for s in SOCIAL_NOT_PROFILE}
+            or not SOCIAL_HANDLE_RE.match(handle)):
+        return ""
+    if page_only and (len(parts) > 2 or (len(parts) == 2
+                                         and parts[1].lower() not in SOCIAL_ABOUT_PAGES)):
+        return ""
+    return f"{site}/{prefix}{handle}".lower()
+
+
+def social_links(doc, page_url: str) -> list[str]:
+    """The business's own social media profiles linked from its page (links,
+    or the JSON-LD "sameAs" list where a site declares its official profiles):
+    at most one per network. When a network is linked more than once (e.g. the
+    firm and its web designer), a declared profile wins, then the one that
+    looks like the site's domain."""
+    label = re.sub(r"[^a-z0-9]", "", root_domain(page_url).split(".")[0])
+    declared = {social_profile(u) for u in json_ld_same_as(doc)} - {""}
+    found: dict[str, list[str]] = {}
+    for prof in [*declared, *(social_profile(a.get("href") or "") for a in dom.anchors(doc))]:
+        if prof:
+            site = prof.split("/")[0]
+            lst = found.setdefault(site, [])
+            if prof not in lst:
+                lst.append(prof)
+
+    def score(prof: str) -> tuple[int, int]:
+        h = re.sub(r"[^a-z0-9]", "", prof.rsplit("/", 1)[-1])
+        return (prof in declared,
+                1 if label and len(label) >= 4 and (label in h or h in label) else 0)
+
+    out = []
+    for site in ("facebook.com", "instagram.com", "x.com", "linkedin.com"):
+        if site in found:
+            out.append(max(found[site], key=score))   # max keeps the first on ties
+    return out[:MAX_SOCIAL_PROFILES]
 
 
 def external_links(doc, page_url: str, skip_check,

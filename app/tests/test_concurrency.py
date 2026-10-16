@@ -248,13 +248,10 @@ def test_real_concurrent_jobs():
     reloaded = StateStore.load(config.STATE_PATH)
     for c in cats:
         assert len(reloaded.records[c]) == targets[c], c
-    from openpyxl import load_workbook
+    from backend.collector.exporter import read_data_rows
     for c in cats:
         path = os.path.join(config.OUTPUT_DIR, st.all_categories()[c]["file"])
-        wb = load_workbook(path, read_only=True)
-        rows = sum(1 for row in wb.active.iter_rows(min_row=2, values_only=True)
-                   if any(v not in (None, "") for v in row))
-        wb.close()
+        rows = len(read_data_rows(path))
         assert rows == targets[c], (c, rows)
     leftovers = [f for f in os.listdir(config.OUTPUT_DIR) if ".tmp" in f]
     assert not leftovers, leftovers
