@@ -219,6 +219,16 @@ def _sheet_title(name: str, used: set[str]) -> str:
     return title
 
 
+def _cell(r: dict, col: str):
+    """The record's value as the workbook shows it. Email Status reads
+    Exist only for a mailbox its mail server confirmed (Valid); Invalid,
+    Risky and Unknown all read Not exist. No email = blank."""
+    v = r.get(col, "")
+    if col == "Email Status" and v:
+        v = "Exist" if v == "Valid" else "Not exist"
+    return xlsx_safe(v)
+
+
 def _layout(records: list[dict], display: str) -> list[tuple[str, list[tuple[str, list[list[str]]]]]]:
     """[(sheet title, [(section heading, rows)])], all in first-seen order."""
     sheets: dict[str, dict[str, tuple[str, list]]] = {}
@@ -230,7 +240,7 @@ def _layout(records: list[dict], display: str) -> list[tuple[str, list[tuple[str
         names.setdefault(skey, sheet)
         secs = sheets.setdefault(skey, {})
         sec = secs.setdefault(section.lower(), (section, []))
-        sec[1].append([xlsx_safe(r.get(col, "")) for col in COLUMNS])
+        sec[1].append([_cell(r, col) for col in COLUMNS])
     used: set[str] = set()
     out = [(_sheet_title(names[k], used), list(secs.values())) for k, secs in sheets.items()]
     return out or [(_sheet_title(display, used), [])]
