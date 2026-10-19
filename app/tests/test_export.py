@@ -54,7 +54,7 @@ def main():
     print("  website / email are clickable")
     assert good[col["Subcategory"]].value is None
     print("  missing values are empty cells")
-    assert ws.auto_filter.ref == "A1:V4" and ws.freeze_panes == "A2"
+    assert ws.auto_filter.ref == "A1:U4" and ws.freeze_panes == "A2"
     print("  header has filter arrows and stays frozen")
 
     for name in ("Company Name", "Business Phone", "Services"):
