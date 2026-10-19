@@ -896,19 +896,27 @@ class CollectionJob:
         if not ok:
             self.say(f"Rejected: {record.get('Company Name', '?')[:50]} ({reason})")
             return False
+        kind = "places" if "_cid" in record else "organic"
+        lk = record.get("_lk", "")
+
+        def store() -> bool:
+            # runs under the registry lock, after the dedup check passed: the
+            # keys are registered only if the target still has room, so a
+            # record refused for a full target is no phantom "Duplicate" later
+            record.pop("_cid", None)
+            record.pop("_lk", None)
+            return self.state.append_record(self.category, record, self.target, self.loc_key)
+
         t0 = time.perf_counter()
-        added, dup_of = self.state.registry.check_and_add(record, self.category)
+        added, dup_of = self.state.registry.check_and_add(record, self.category, commit=store)
         self.timings.add("dedup", time.perf_counter() - t0)
         if not added:
+            if not dup_of:   # target already full: not stored, not registered
+                return False
             self._bump("duplicates")
             with self.state.lock:
                 self.state.stats[self.category]["duplicates"] += 1
             self.say(f"Duplicate: {record['Company Name'][:50]} (already have {dup_of})")
-            return False
-        kind = "places" if "_cid" in record else "organic"
-        record.pop("_cid", None)
-        lk = record.pop("_lk", "")
-        if not self.state.append_record(self.category, record, self.target, self.loc_key):
             return False
         self._last_new_record = time.time()
         self._bump("valid")
@@ -1044,7 +1052,7 @@ class CollectionJob:
         except Exception as exc:   # out of credits / network: skip, never fatal
             self.say(f"Social page lookup failed for {firm[:50]}: {str(exc)[:80]}")
             return [], ""
-        credits = int(getattr(p, "last_credits", 1) or 1)
+        credits = int(getattr(p, "last_credits", 1))
         self._sync_provider_counters()
         self._bump("social_lookups")
         self.state.ledger.record(
@@ -1425,7 +1433,7 @@ class CollectionJob:
             self.state.cache_put(key, list(result))
             # Serper's own per-response credit count (1 per page today),
             # thread-local in the provider so parallel searches don't mix
-            credits = int(getattr(self.provider, "last_credits", 1) or 1)
+            credits = int(getattr(self.provider, "last_credits", 1))
             return result, "api", credits
         finally:
             if paid:
@@ -2119,7 +2127,7 @@ class CollectionJob:
         with self.state.lock:
             recs = list(self.state.records[self.category])
         doms: set[str] = set()
-        names: set[str] = set()
+        names: set[tuple[str, str]] = set()
         dup_dom = dup_name = 0
         for r in recs:
             d = norm_domain(r.get("Official Website") or "")
@@ -2127,9 +2135,9 @@ class CollectionJob:
             if d:
                 dup_dom += d in doms
                 doms.add(d)
-            if nm:
-                dup_name += nm in names
-                names.add(nm)
+            if nm:   # same name on different websites = distinct businesses
+                dup_name += (nm, d) in names
+                names.add((nm, d))
         if dup_dom or dup_name:
             log.warning("final dedup check: %d duplicate domain(s), %d duplicate "
                         "name(s) among %d records", dup_dom, dup_name, len(recs))

@@ -25,7 +25,9 @@ response cache is shared between users (internally locked).
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -43,7 +45,22 @@ def _slot(job) -> tuple:
 
 
 def _credits(job) -> int:
-    return int(getattr(job, "counters", {}).get("serper_credits", 0) or 0)
+    """All Serper credits the job spent (own key + server key)."""
+    n = int(getattr(job, "counters", {}).get("serper_credits", 0) or 0)
+    p = getattr(job, "provider", None)
+    # the provider's count is live; the job's counter is synced periodically
+    return max(n, int(getattr(p, "credits_used", 0) or 0))
+
+
+def _server_credits(job) -> int:
+    """Credits the job spent on the app's shared server key - whatever key
+    it holds now (a running job can switch keys either way)."""
+    p = getattr(job, "provider", None)
+    n = getattr(p, "server_credits_used", None)
+    if n is not None:
+        return int(n or 0)
+    # no provider (yet) or one without the split: its current key decides
+    return 0 if getattr(job, "serper_key", "") else _credits(job)
 
 
 class JobRejected(Exception):
@@ -54,10 +71,13 @@ class JobRejected(Exception):
 
 
 class JobManager:
+    SPEND_SAVE_S = 10.0     # how often the per-network spend is written to disk
+
     def __init__(self, state: StateStore | None = None, max_active: int | None = None,
-                 job_factory=CollectionJob, state_for=None):
+                 job_factory=CollectionJob, state_for=None, spend_path: str | None = None):
         # state_for(client) -> that user's StateStore (per-user data); without
-        # it every job uses the one `state`.
+        # it every job uses the one `state`. spend_path: JSON file keeping the
+        # per-network daily spend across worker restarts (None = memory only).
         self.state = state
         self.state_for = state_for or (lambda client: state)
         self.max_active = max_active or config.MAX_ACTIVE_JOBS
@@ -69,8 +89,12 @@ class JobManager:
         self.history: deque[str] = deque()              # finished ids, oldest first
         self.by_client: dict[str, str] = {}             # client -> latest job id
         self.changed: set[str] = set()                  # ids changed since last drain
-        # ip -> (finished at, Serper credits) of finished jobs, last 24 h
+        # ip -> (finished at, server-key Serper credits) of finished jobs, last 24 h
         self.ip_spend: dict[str, deque] = {}
+        self.spend_path = spend_path
+        self._spend_saved = ""
+        self._spend_saved_at = 0.0
+        self._load_spend()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._reaper, daemon=True,
                                         name="jobs-reaper")
@@ -143,6 +167,9 @@ class JobManager:
             job.ip = ip
             job.serper_key = serper_key
             budget = getattr(job, "credit_budget", None)
+            # the uncapped budget: restored if the job switches to the
+            # user's own key, re-capped if it switches to the server's
+            job.base_credit_budget = budget
             if remaining is not None and budget is not None \
                     and (budget == 0 or budget > remaining):
                 job.credit_budget = remaining
@@ -187,6 +214,72 @@ class JobManager:
             self.changed.add(jid)
             return job
 
+    def set_key(self, client: str, serper_key: str = "") -> CollectionJob | None:
+        """The client saved (key) or removed ("") their own Serper key: their
+        queued / running job switches to it. Moving onto the server's key
+        re-applies the network's daily cap to what the job may still spend
+        (it was submitted uncapped on its own key); moving off it lifts the
+        cap again. Returns the job, or None when nothing is active."""
+        job = self.client_job(client)
+        if job is None or job.status not in ACTIVE_STATUSES:
+            return None
+        # outside self.lock: the job takes its own lock and logs
+        job.use_serper_key(serper_key)
+        with self.lock:
+            if job.status not in ACTIVE_STATUSES:
+                return job
+            if serper_key:
+                base = getattr(job, "base_credit_budget", None)
+                if base is not None:
+                    job.credit_budget = base
+                job.budget_reason = ""
+                if getattr(job, "ip_cap_stopped", False) \
+                        and getattr(job, "_stop_search", "") == "budget":
+                    job._stop_search = ""       # our cap stopped it: searches resume
+                job.ip_cap_stopped = False
+            else:
+                self._apply_ip_cap(job)
+            self.changed.add(job.id)
+            return job
+
+    def _apply_ip_cap(self, job: CollectionJob):
+        """Cap what an active job may still spend on the server's key at what
+        its network has left of the daily limit (caller holds self.lock)."""
+        cap = config.MAX_CREDITS_PER_IP_PER_DAY
+        ip = getattr(job, "ip", "")
+        budget = getattr(job, "credit_budget", None)
+        if not cap or not ip or budget is None:
+            return
+        remaining = cap - self._ip_credits_24h(ip)
+        spent = _credits(job)
+        if remaining > 0:
+            if budget == 0 or budget > spent + remaining:
+                job.credit_budget = spent + remaining
+                job.budget_reason = (
+                    f"Daily search limit of your network reached ({cap} Serper "
+                    f"credits per 24 h, {remaining} were left for this collection)")
+            return
+        reason = (f"Daily search limit of your network reached ({cap} Serper credits "
+                  f"per 24 h)")
+        job.budget_reason = reason
+        if job.id in self.queue:          # never started: finish it right here
+            job.stop()
+            self.queue.remove(job.id)
+            job.status = "stopped"
+            job.stop_reason = reason + "."
+            job.finished_at = datetime.now().isoformat(timespec="seconds")
+            job.say(f"Stopped before it started: {reason}. Add your own Serper "
+                    f"API key to continue.")
+            self._retire(job)
+            self._schedule()
+            return
+        # running: no further searches (a budget of 0 would mean "no cap")
+        job.credit_budget = max(1, spent)
+        job._stop_search = "budget"
+        job.ip_cap_stopped = True
+        job.say(f"{reason} - no further searches on the app's key; finishing "
+                f"in-flight work. Add your own Serper API key to continue.")
+
     def stop_all(self, timeout: float = 20.0):
         """Shutdown: stop every job (progress is saved by each job)."""
         with self.lock:
@@ -201,6 +294,7 @@ class JobManager:
             if j.thread is not None:
                 j.thread.join(max(0.1, t_end - time.time()))
         self._stop.set()
+        self._save_spend(force=True)
 
     def category_busy(self, category: str, state: StateStore | None = None) -> bool:
         """A job of `state`'s data (default: any) is filling `category`."""
@@ -252,10 +346,11 @@ class JobManager:
             self._schedule()
 
     def _ip_credits_24h(self, ip: str) -> int:
-        """Serper credits spent by `ip` in the last 24 h: finished jobs plus
-        what running ones spent so far (caller holds lock). Jobs from one
-        address that run at once can together overshoot the daily limit by
-        at most what they spend in parallel (MAX_JOBS_PER_IP of them)."""
+        """Server-key Serper credits spent by `ip` in the last 24 h: finished
+        jobs plus what running ones spent on it so far, whichever key they
+        hold now (caller holds lock). Jobs from one address that run at once
+        can together overshoot the daily limit by at most what they spend in
+        parallel (MAX_JOBS_PER_IP of them)."""
         now = time.time()
         spent = self.ip_spend.get(ip)
         while spent and now - spent[0][0] > 86400:
@@ -263,16 +358,16 @@ class JobManager:
         if spent is not None and not spent:
             del self.ip_spend[ip]
         return (sum(c for _, c in spent or ())
-                + sum(_credits(j) for j in self.active.values()
-                      if getattr(j, "ip", "") == ip
-                      and not getattr(j, "serper_key", "")))
+                + sum(_server_credits(j) for j in self.active.values()
+                      if getattr(j, "ip", "") == ip))
 
     def _retire(self, job: CollectionJob):
         """Move a finished job to the bounded history (caller holds lock)."""
-        # credits of the user's own key don't count against the server's cap
-        if getattr(job, "ip", "") and _credits(job) and not getattr(job, "serper_key", ""):
-            self.ip_spend.setdefault(job.ip, deque()).append((time.time(),
-                                                              _credits(job)))
+        # only the server key's credits count against the network's cap -
+        # by what was spent on it, not by the key the job ends with
+        server = _server_credits(job)
+        if getattr(job, "ip", "") and server:
+            self.ip_spend.setdefault(job.ip, deque()).append((time.time(), server))
         self.history.append(job.id)
         while len(self.history) > config.JOB_HISTORY:
             old = self.history.popleft()
@@ -298,3 +393,66 @@ class JobManager:
                     self.changed.add(j.id)
                 if dead:
                     self._schedule()
+            try:
+                self._save_spend()
+            except Exception:                # the reaper itself must keep running
+                log.exception("saving per-network spend failed")
+
+    # -- per-network spend on disk ----------------------------------------------
+    def _load_spend(self):
+        """Spend of the last 24 h saved by an earlier worker: a restart must
+        not reset the daily cap."""
+        if not self.spend_path:
+            return
+        try:
+            with open(self.spend_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            log.warning("per-network spend unreadable (%s); starting empty", exc)
+            return
+        now = time.time()
+        for ip, rows in (data.get("ip_spend") or {}).items() \
+                if isinstance(data, dict) else ():
+            try:
+                keep = deque(sorted((float(t), int(c)) for t, c in rows
+                                    if now - float(t) <= 86400 and int(c) > 0))
+            except (TypeError, ValueError):
+                continue
+            if keep:
+                self.ip_spend[str(ip)] = keep
+
+    def _save_spend(self, force: bool = False):
+        """Every SPEND_SAVE_S: finished jobs' spend plus running jobs' live
+        server-key spend (a worker that dies mid-job keeps it charged; its
+        resumed job starts counting from 0)."""
+        if not self.spend_path:
+            return
+        now = time.time()
+        if not force and now - self._spend_saved_at < self.SPEND_SAVE_S:
+            return
+        self._spend_saved_at = now
+        with self.lock:
+            out: dict[str, list] = {}
+            for ip in list(self.ip_spend):
+                self._ip_credits_24h(ip)          # drops entries older than 24 h
+                if ip in self.ip_spend:
+                    out[ip] = [[t, c] for t, c in self.ip_spend[ip]]
+            for j in self.active.values():
+                ip, c = getattr(j, "ip", ""), _server_credits(j)
+                if ip and c:
+                    out.setdefault(ip, []).append([now, c])
+        blob = json.dumps({"ip_spend": out}, sort_keys=True)
+        if blob == self._spend_saved or (not out and not self._spend_saved
+                                         and not os.path.exists(self.spend_path)):
+            return
+        try:
+            os.makedirs(os.path.dirname(self.spend_path) or ".", exist_ok=True)
+            tmp = f"{self.spend_path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(blob)
+            os.replace(tmp, self.spend_path)
+            self._spend_saved = blob
+        except OSError as exc:
+            log.warning("could not save per-network spend: %s", exc)

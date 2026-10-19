@@ -45,6 +45,7 @@ NAME_MAX = 60
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
 SESSION_CACHE_S = 60.0           # a session is re-checked in the DB at most this often
 SESSION_CACHE_MAX = 5000
+MISS_CACHE_MAX = 2000            # unknown tokens, cached apart (can't evict real sessions)
 EVENTS_KEEP_DAYS = 90            # login / logout history kept in the database
 EVENTS_KEEP_LOCAL = 5000         # ... and in the local accounts file
 ONLINE_S = 120                   # "online now" = a request within this many seconds
@@ -357,7 +358,8 @@ class FileStore(MemoryStore):
 
 _store = None
 _store_lock = threading.Lock()
-_cache: "OrderedDict[str, tuple[float, dict | None]]" = OrderedDict()
+_cache: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()       # valid sessions
+_miss_cache: "OrderedDict[str, float]" = OrderedDict()               # unknown tokens
 
 
 def enabled() -> bool:
@@ -370,6 +372,7 @@ def use_store(store):
     with _store_lock:
         _store = store
         _cache.clear()
+        _miss_cache.clear()
 
 
 def _get_store():
@@ -546,13 +549,24 @@ async def session_user(token: str) -> dict | None:
     hit = _cache.get(th)
     if hit is not None and hit[0] > time.monotonic():
         return hit[1]
+    miss = _miss_cache.get(th)
+    if miss is not None and miss > time.monotonic():
+        return None
     s = await _call(_get_store().session, th)
     user = ({"id": s["user_id"], "name": s["name"], "email": s["email"],
              "is_admin": is_admin(s["email"])} if s else None)
-    _cache[th] = (time.monotonic() + SESSION_CACHE_S, user)
-    _cache.move_to_end(th)
-    while len(_cache) > SESSION_CACHE_MAX:
-        _cache.popitem(last=False)
+    # misses (bogus / expired tokens) go to their own, smaller cache, so a
+    # flood of made-up tokens can't evict the real sessions from _cache
+    until = time.monotonic() + SESSION_CACHE_S
+    if user is not None:
+        cache, cap = _cache, SESSION_CACHE_MAX
+        cache[th] = (until, user)
+    else:
+        cache, cap = _miss_cache, MISS_CACHE_MAX
+        cache[th] = until
+    cache.move_to_end(th)
+    while len(cache) > cap:
+        cache.popitem(last=False)
     return user
 
 
@@ -560,6 +574,7 @@ async def logout(token: str, ip: str = ""):
     user = await session_user(token)
     th = _token_hash(token)
     _cache.pop(th, None)
+    _miss_cache.pop(th, None)
     await _call(_get_store().delete_session, th)
     if user is not None:
         last_seen.pop(user["id"], None)      # logged out = not online any more

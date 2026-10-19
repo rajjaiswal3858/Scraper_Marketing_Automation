@@ -27,6 +27,18 @@ _CREDIT_RE = re.compile(r"credit|quota|balance|not enough", re.I)
 BACKOFF_CAP_S = 30.0
 
 
+def _reported_credits(data: dict) -> int:
+    """Credits Serper reports for a response: 1 when missing or unreadable,
+    but an explicit 0 (a free / cached answer) is honoured."""
+    raw = data.get("credits")
+    if raw is None:
+        return 1
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 1
+
+
 class AdaptiveRate:
     """Adaptive request pacing: paces calls at `rps`, backs off on 429 or
     timeouts, and creeps back up after sustained successes. Never exceeds
@@ -160,6 +172,9 @@ class SerperProvider(SearchProvider):
             self.rate = AdaptiveRate(config.SERPER_RPS)
             self._slots = None
         self.credits_used = 0
+        # the part of credits_used spent on the app's shared server key
+        # (follow_env) - the per-network daily cap protects only that key
+        self.server_credits_used = 0
         self._requests = 0
         self.ok_count = 0
         self.fail_count = 0
@@ -178,7 +193,9 @@ class SerperProvider(SearchProvider):
 
     @property
     def last_credits(self) -> int:
-        """Credits Serper billed for the calling thread's last request."""
+        """Credits charged for the calling thread's last request: what Serper
+        reported for the answer plus 1 per timed-out attempt (it may have
+        been billed server-side)."""
         return getattr(self._tl, "credits", 1)
 
     def _event(self, kind: str):
@@ -222,6 +239,13 @@ class SerperProvider(SearchProvider):
         with self.lock:
             setattr(self, attr, getattr(self, attr) + n)
 
+    def _charge(self, credits: int):
+        """Credits spent by one request, on whichever key it was sent with."""
+        with self.lock:
+            self.credits_used += credits
+            if self.follow_env:
+                self.server_credits_used += credits
+
     @staticmethod
     def _backoff(attempt: int, retry_after: float) -> float:
         """Exponential backoff with jitter: ~1 s, 2 s, 4 s ... capped; a
@@ -242,6 +266,7 @@ class SerperProvider(SearchProvider):
         last, retry_after = "", 0.0
         attempts = config.SERPER_MAX_ATTEMPTS
         self._tl.timeouts = 0
+        self._tl.credits = 0
         for attempt in range(attempts):
             # Credit guard: 429 / 5xx / connection errors are never charged,
             # so they get the full backoff budget - but a request that timed
@@ -268,6 +293,11 @@ class SerperProvider(SearchProvider):
                 self._event("timeout")
                 self.rate.on_backoff()
                 self._tl.timeouts += 1
+                # Sent but unanswered: Serper may have processed and billed
+                # it. Count it (conservatively) toward credits / daily cap /
+                # budget instead of letting timeouts spend for free.
+                self._tl.credits += 1
+                self._charge(1)
                 last = "timeout"
                 continue
             except requests.ConnectionError as exc:   # DNS / refused / reset
@@ -292,10 +322,10 @@ class SerperProvider(SearchProvider):
                 self.rate.on_ok()
                 n = len(data.get("places") or data.get("organic") or [])
                 self._log_req(url, payload, t_start, 200, n)
-                self._tl.credits = int(data.get("credits", 1) or 1)
-                with self.lock:
-                    self.credits_used += self._tl.credits
-                    self.ok_count += 1
+                credits = _reported_credits(data)
+                self._tl.credits += credits
+                self._charge(credits)
+                self._count("ok_count")
                 return data
             self._log_req(url, payload, t_start, status, 0)
             body = resp.text[:200]

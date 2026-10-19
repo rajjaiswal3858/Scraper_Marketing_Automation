@@ -37,6 +37,8 @@ from .collector.stores import StoreRegistry
 
 log = logging.getLogger("worker")
 
+MAX_CUSTOM_CATEGORIES = 50      # per user: each one is a category + an Excel file
+
 
 def _setup_logging():
     """Worker log -> output/worker.log through a queue (the writing happens
@@ -72,7 +74,10 @@ class Worker:
         self.send_lock = threading.Lock()
         # every user's records / stats / Excel files are their own
         self.stores = StoreRegistry()
-        self.manager = JobManager(state_for=self.stores.get)
+        # the per-network daily credit cap survives worker restarts
+        self.manager = JobManager(state_for=self.stores.get,
+                                  spend_path=os.path.join(config.OUTPUT_DIR,
+                                                          "ip_spend.json"))
         self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="rpc")
         self.stopping = threading.Event()
         self.epoch = f"{os.getpid()}-{int(time.time())}"
@@ -235,19 +240,48 @@ class Worker:
                     provider: str, max_queries: int, job_id: str | None = None,
                     ip: str = "", serper_key: str = ""):
         state = self.stores.get(client)
+        created = ""
         if category == "__custom__":
             name = " ".join(custom_category.split())
             if len(name) < 3:
                 raise JobRejected(400, "Enter a custom category name (3+ characters).")
+            with state.lock:
+                known = {d["display"].lower() for d in state.custom.values()}
+                before = set(state.custom)
+            if name.lower() not in known and len(before) >= MAX_CUSTOM_CATEGORIES:
+                raise JobRejected(400, f"You have {len(before)} custom categories "
+                                       f"(the limit is {MAX_CUSTOM_CATEGORIES}). "
+                                       f"Delete one you no longer need first.")
             category = state.ensure_custom(name)
+            if category not in before:
+                created = category
         elif category not in state.all_categories():
             raise JobRejected(400, "unknown category")
-        job = self.manager.submit(client, category, keywords, location, target,
-                                  provider, max_queries, geo=geo, job_id=job_id,
-                                  ip=ip, serper_key=serper_key)
+        try:
+            job = self.manager.submit(client, category, keywords, location, target,
+                                      provider, max_queries, geo=geo, job_id=job_id,
+                                      ip=ip, serper_key=serper_key)
+        except Exception:
+            # a rejected collection (busy / limit / capacity) leaves no
+            # empty custom category behind
+            if created:
+                self._drop_new_custom(state, created)
+            raise
         view = self.job_view(job)
         _, view["log"], _ = job.log_since(0)
         return view
+
+    @staticmethod
+    def _drop_new_custom(state: StateStore, slug: str):
+        """Undo ensure_custom() of a category nothing was collected into."""
+        with state.lock:
+            if slug not in state.custom or state.records.get(slug):
+                return
+            del state.custom[slug]
+            state.records.pop(slug, None)
+            state.stats.pop(slug, None)
+            state.cat_rev.pop(slug, None)
+            state.rev += 1
 
     def cmd_stop(self, client: str, job_id: str | None = None):
         job = self.manager.stop(client, job_id)
@@ -284,10 +318,11 @@ class Worker:
     def cmd_set_key(self, client: str, serper_key: str = ""):
         """The caller saved / removed their own Serper key: their queued or
         running collection switches to it (a credit-paused one resumes)."""
-        job = self.manager.client_job(client)
-        if job is None or job.status not in ACTIVE_STATUSES:
+        # the manager re-applies (server key) or lifts (own key) the
+        # network's daily credit cap on the switched job
+        job = self.manager.set_key(client, serper_key)
+        if job is None:
             return {"switched": False}
-        job.use_serper_key(serper_key)
         return {"switched": True, "job_id": job.id}
 
     def cmd_export(self, client: str, name: str):

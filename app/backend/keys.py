@@ -62,17 +62,22 @@ class FileStore:
         self.keys: dict[str, str] | None = None
 
     def _load(self) -> dict[str, str]:
+        """A file that exists but can't be read (corrupt, or locked for a
+        moment by antivirus / backup) is NEVER cached as an empty map: the
+        call fails and the next one retries, so no save can wipe the keys."""
         if self.keys is None:
             try:
                 with open(self.path, encoding="utf-8") as f:
                     data = json.load(f)
-                self.keys = {str(k): str(v) for k, v in data.items()} \
-                    if isinstance(data, dict) else {}
+                if not isinstance(data, dict):
+                    raise ValueError("not a JSON object")
+                self.keys = {str(k): str(v) for k, v in data.items()}
             except FileNotFoundError:
                 self.keys = {}
             except (OSError, ValueError):
-                log.exception("could not read %s", self.path)
-                self.keys = {}
+                log.exception("could not read %s - saved keys unavailable until it "
+                              "can be read (the file is left untouched)", self.path)
+                raise
         return self.keys
 
     def _save(self):

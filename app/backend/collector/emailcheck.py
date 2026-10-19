@@ -49,6 +49,7 @@ VALID, RISKY, INVALID, UNKNOWN = "Valid", "Risky", "Invalid", "Unknown"
 
 DNS_TIMEOUT = 5
 CACHE_TTL_S = 6 * 3600
+UNKNOWN_TTL_S = 5 * 60           # an Unknown verdict (DNS timeout, error, ...) is retried soon
 CACHE_MAX = 20_000
 PORT25_OK_TTL_S = 6 * 3600       # re-test an open port 25 this often
 PORT25_BLOCKED_TTL_S = 30 * 60   # ... and a blocked one this often
@@ -114,9 +115,9 @@ def _cache_get(store: OrderedDict, key: str):
         return hit[1]
 
 
-def _cache_put(store: OrderedDict, key: str, value):
+def _cache_put(store: OrderedDict, key: str, value, ttl: float | None = None):
     with _lock:
-        store[key] = (time.monotonic() + CACHE_TTL_S, value)
+        store[key] = (time.monotonic() + (CACHE_TTL_S if ttl is None else ttl), value)
         store.move_to_end(key)
         while len(store) > CACHE_MAX:
             store.popitem(last=False)
@@ -287,8 +288,14 @@ def verify(email: str) -> Verdict:
     except Exception as exc:   # one odd address must never stop a run
         log.exception("email check failed for %s", email)
         v = Verdict(email, UNKNOWN, 50, f"check failed ({type(exc).__name__})")
-    # an inconclusive probe (busy server, greylisting) is retried next time
-    if "no clear answer" not in v.detail:
+    # an inconclusive probe (busy server, greylisting) is retried next time;
+    # any other Unknown (DNS timeout, check failed, port 25 blocked) is a
+    # transient condition, not an answer about the mailbox: kept only briefly
+    if "no clear answer" in v.detail:
+        pass
+    elif v.status == UNKNOWN:
+        _cache_put(_verdicts, email, v, UNKNOWN_TTL_S)
+    else:
         _cache_put(_verdicts, email, v)
     return v
 

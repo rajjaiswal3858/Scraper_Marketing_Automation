@@ -44,6 +44,17 @@ def ledger_key(kind: str, query: str, page: int = 1) -> str:
     return f"{kind}|{norm_query(query)}|p{int(page or 1)}"
 
 
+_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe(value) -> str:
+    """A text cell Excel will not run as a formula: query / category text
+    is user input ("=HYPERLINK(...)" would execute when the ledger CSV is
+    opened), so a cell starting with = + - @ tab or CR gets a leading '."""
+    s = "" if value is None else str(value)
+    return "'" + s if s.startswith(_FORMULA_START) else s
+
+
 def _blank_totals() -> dict:
     return {k: {"credits": 0, "requests": 0, "results": 0, "new": 0,
                 "duplicates": 0, "valid": 0, "timeouts": 0} for k in KINDS}
@@ -222,8 +233,9 @@ class CreditLedger:
             for e in rows:
                 cr = e.get("credits", 0)
                 w.writerow([time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e.get("ts", 0)))
-                            if e.get("ts") else "", e.get("category", ""), e["kind"],
-                            e["query"], e["page"], cr, e["results"], e["new"],
+                            if e.get("ts") else "", csv_safe(e.get("category", "")),
+                            csv_safe(e["kind"]), csv_safe(e["query"]), e["page"], cr,
+                            e["results"], e["new"],
                             e["duplicates"], e["valid"],
                             round(e["valid"] / cr, 2) if cr else "",
                             e.get("cache_hits", 0), e.get("timeouts", 0)])

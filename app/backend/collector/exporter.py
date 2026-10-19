@@ -208,11 +208,13 @@ def _placement(r: dict, legacy_state: str, default_sheet: str) -> tuple[str, str
 
 
 def _sheet_title(name: str, used: set[str]) -> str:
-    base = re.sub(r"[\[\]:*?/\\]", "-", name).strip("' ")[:31] or "Results"
+    # truncate first, then strip: Excel rejects a title that starts or ends
+    # with an apostrophe, and cutting at 31 can expose one at the end
+    base = re.sub(r"[\[\]:*?/\\]", "-", name).strip("' ")[:31].strip("' ") or "Results"
     title, n = base, 2
     while title.lower() in used:
         suffix = f" ({n})"
-        title, n = base[:31 - len(suffix)] + suffix, n + 1
+        title, n = base[:31 - len(suffix)].rstrip("' ") + suffix, n + 1
     used.add(title.lower())
     return title
 

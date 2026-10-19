@@ -118,7 +118,8 @@ def validate(record: dict, from_places: bool) -> tuple[bool, str]:
     attribute."""
     name = record.get("Company Name", "")
     website = record.get("Official Website", "")
-    if not name or len(name) < 3 or not norm_name(name):
+    # norm_name needs 2+ letters/digits of any script: IBM, 3M, H&M, BP plc
+    if not name or not norm_name(name):
         return False, "no plausible company name"
     if MEDIA_NAME_RE.search(name) or JUNK_NAME_RE.search(name):
         return False, f"name looks like publisher/article: {name[:40]}"

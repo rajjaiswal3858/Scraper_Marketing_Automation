@@ -52,9 +52,9 @@ still fails is recorded and re-tried once on the next run.
 
 from __future__ import annotations
 
-import re
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 
 _FILLER = {
@@ -98,14 +98,35 @@ def _stem(w: str) -> str:
     return w
 
 
+def _words(text: str, extra: str = "") -> list[str]:
+    """Casefolded word tokens: runs of Unicode letters / digits (plus their
+    combining marks, e.g. Devanagari vowel signs) and the `extra` symbols.
+    Non-Latin scripts are kept - keeping only [a-z0-9] collapsed "dentists
+    in 東京" and "dentists in 大阪" into one registry key. For pure-ASCII text
+    this is exactly the old [a-z0-9<extra>]+ tokenisation of text.lower(),
+    so existing ledgers / caches keep their keys."""
+    text = unicodedata.normalize("NFKC", text or "").casefold()
+    out: list[str] = []
+    cur: list[str] = []
+    for ch in text:
+        if ch.isalnum() or ch in extra or (cur and unicodedata.category(ch)[0] == "M"):
+            cur.append(ch)
+        elif cur:
+            out.append("".join(cur))
+            cur = []
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
 def canon_phrase(phrase: str) -> str:
-    toks = [_stem(t) for t in re.findall(r"[a-z0-9&+#]+", phrase.lower())]
+    toks = [_stem(t) for t in _words(phrase, "&+#")]
     keep = sorted({t for t in toks if t not in _FILLER and t not in _BIZ_NOUNS})
     return " ".join(keep) or " ".join(sorted(set(toks)))
 
 
 def canon_geo(geo: str) -> str:
-    return " ".join(re.findall(r"[a-z0-9]+", geo.lower()))
+    return " ".join(_words(geo))
 
 
 @dataclass

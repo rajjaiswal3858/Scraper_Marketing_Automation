@@ -36,6 +36,10 @@ jobs:
       - run: python tests/test_performance.py
       - run: python tests/test_resilience.py
       - run: python tests/test_emailcheck.py
+      - run: python tests/test_bugfix_auth.py
+      - run: python tests/test_bugfix_credits.py
+      - run: python tests/test_bugfix_pipeline.py
+      - run: python tests/test_bugfix_extract.py
 
   windows-smoke:
     # the smoke test drives a real server and kills its worker (Windows

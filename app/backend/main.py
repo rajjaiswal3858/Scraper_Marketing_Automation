@@ -105,6 +105,7 @@ MAX_BODY_BYTES = 64 * 1024
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 # reachable without a session when login is required
 AUTH_OPEN = ("/api/auth/signup", "/api/auth/login")
+RETRY = ((b"retry-after", b"30"),)       # extra headers on a 429
 SAFE_FILE_RE = re.compile(r"^[\w\-. ]+\.xlsx$")
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 JSON_T = b"application/json"
@@ -586,25 +587,32 @@ class Guard:
         self.rl = RateLimiter()
         self.stats = AccessStats()
 
-    def _reject(self, path: str, headers: dict, ip: str, who: str):
-        """(status, detail, extra headers) or None."""
+    def _reject_ip(self, path: str, headers: dict, ip: str):
+        """Checks that need only the caller's address - run BEFORE the session
+        lookup, so a flood (bogus tokens included) is 429'd without a database
+        call. (status, detail, extra headers) or None."""
         try:
             if int(headers.get(b"content-length", b"0") or 0) > MAX_BODY_BYTES:
                 return 413, "Request body too large", ()
         except ValueError:
             return 400, "Invalid Content-Length", ()
-        retry = ((b"retry-after", b"30"),)
         if self.rl.hit(f"ip|{ip}", config.RATE_LIMIT_IP_PER_MIN):
             log.warning("rate limit (per IP) exceeded: ip=%s path=%s", ip, path)
-            return 429, "Too many requests, slow down", retry
+            return 429, "Too many requests, slow down", RETRY
         if path == "/api/serper-key" and \
                 self.rl.hit(f"key|{ip}", config.RATE_LIMIT_AUTH_PER_IP_PER_MIN):
             log.warning("rate limit (API key) exceeded: ip=%s", ip)
-            return 429, "Too many attempts - wait a minute and try again", retry
+            return 429, "Too many attempts - wait a minute and try again", RETRY
+        if path in AUTH_OPEN and \
+                self.rl.hit(f"auth|{ip}", config.RATE_LIMIT_AUTH_PER_IP_PER_MIN):
+            log.warning("rate limit (login) exceeded: ip=%s", ip)
+            return 429, "Too many attempts - wait a minute and try again", RETRY
+        return None
+
+    def _reject(self, path: str, headers: dict, ip: str, who: str):
+        """Per-client checks (who = account or client id, known after the
+        session lookup) + the access code. (status, detail, headers) or None."""
         if path in AUTH_OPEN:
-            if self.rl.hit(f"auth|{ip}", config.RATE_LIMIT_AUTH_PER_IP_PER_MIN):
-                log.warning("rate limit (login) exceeded: ip=%s", ip)
-                return 429, "Too many attempts - wait a minute and try again", retry
             who = who or f"ip:{ip}"
         if not who:
             if path != "/api/health":
@@ -615,10 +623,10 @@ class Guard:
             if self.rl.hit(f"collect-ip|{ip}", config.RATE_LIMIT_COLLECT_PER_IP_PER_MIN) \
                     or self.rl.hit(f"collect|{who}", config.RATE_LIMIT_COLLECT_PER_MIN):
                 log.warning("rate limit (collect) exceeded: client=%s ip=%s", who[:12], ip)
-                return 429, "Too many requests, slow down", retry
+                return 429, "Too many requests, slow down", RETRY
         elif self.rl.hit(f"api|{who}", config.RATE_LIMIT_CLIENT_PER_MIN):
             log.warning("rate limit exceeded: client=%s ip=%s path=%s", who[:12], ip, path)
-            return 429, "Too many requests, slow down", retry
+            return 429, "Too many requests, slow down", RETRY
         token = config.auth_token()
         if token and path != "/api/health":
             supplied = headers.get(b"x-auth-token", b"")
@@ -650,14 +658,16 @@ class Guard:
         headers = dict(scope["headers"])
         ip = client_ip(scope, headers)
         who = client_key(headers)
-        bad = None
+        guarded = is_api and method != "OPTIONS"
+        # per-IP limits first: every request counts, logged in or not
+        bad = self._reject_ip(path, headers, ip) if guarded else None
         # The shared access code is the outer gate: without it, answer
         # "Access code required" (from _reject below), not "Please log in" -
         # otherwise the page shows the login form and can never ask for it.
         token = config.auth_token()
         code_ok = not token or hmac.compare_digest(
             headers.get(b"x-auth-token", b""), token.encode())
-        if (is_api and method != "OPTIONS" and auth.enabled() and code_ok
+        if (guarded and bad is None and auth.enabled() and code_ok
                 and path != "/api/health" and path not in AUTH_OPEN):
             # logged-in users: the account is the identity, not the browser
             try:
@@ -670,7 +680,7 @@ class Guard:
             elif bad is None:
                 bad = (401, "Please log in", ((b"x-login-required", b"1"),))
         scope["bdc"] = (who, ip)          # for the FastAPI endpoints
-        if is_api and method != "OPTIONS":
+        if guarded:
             bad = bad or self._reject(path, headers, ip, who)
             if bad is not None:
                 await self._send(send, Reply(bad[0], fastjson.dumps({"detail": bad[1]}),

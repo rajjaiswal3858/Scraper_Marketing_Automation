@@ -5,6 +5,7 @@ Nothing is fabricated: missing values stay blank."""
 
 from __future__ import annotations
 
+import html
 import json
 import re
 from urllib.parse import unquote
@@ -42,12 +43,44 @@ def find_emails(s: str) -> list[str]:
     return out
 
 
-BAD_EMAIL_PARTS = (
-    "example.", "sentry", "wixpress", "domain.com", "email.com", "yourdomain",
-    "@2x", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", "schema.org",
-    "w3.org", "noreply", "no-reply", "donotreply", "@sentry", "your@",
-    "name@", "user@", "@test.", "@localhost", "jquery", "bootstrap",
-)
+# Junk markers are matched on whole labels / exact parts, never substrings:
+# "sentry" must not drop info@sentrysecurity.com, "domain.com" must not drop
+# sales@bigdomain.com.
+# A domain label (other than the TLD - test fixtures use the .example TLD)
+# that marks a placeholder or tracker domain.
+BAD_EMAIL_LABELS = {
+    "example", "sentry", "wixpress", "localhost", "yourdomain", "your-domain",
+    "mydomain", "yourcompany", "yoursite", "yourwebsite",
+}
+# Exact domains (two-label placeholders) ...
+BAD_EMAIL_DOMAINS = {
+    "domain.com", "email.com", "test.com", "test.net", "test.org",
+}
+# ... and domains blocked with all their subdomains.
+BAD_EMAIL_DOMAIN_SUFFIXES = ("schema.org", "w3.org", "sentry.io", "wixpress.com")
+BAD_EMAIL_LOCALS = {
+    "your", "yourname", "youremail", "your.name", "your.email", "jquery",
+    "bootstrap",
+}
+BAD_EMAIL_LOCAL_PREFIXES = ("noreply", "donotreply")   # after dropping . _ -
+PLACEHOLDER_EMAILS = {
+    "name@company.com", "user@company.com", "email@company.com",
+    "your@company.com", "john@doe.com", "jane@doe.com", "johndoe@gmail.com",
+    "john.doe@gmail.com",
+}
+# File extensions that end asset names caught by the regex ("logo@2x.png",
+# "bootstrap@5.3.0.min.css"); none of them is a real TLD.
+ASSET_EXTS = {
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "avif", "ico", "bmp", "tif",
+    "tiff", "heic", "js", "css", "map", "json", "min", "html", "htm", "php",
+    "txt", "xml", "pdf", "woff", "ttf", "eot", "webm",
+}
+_RETINA_LABEL_RE = re.compile(r"^\d+x$")          # "@2x", "@3x" asset suffixes
+_VERSION_DOMAIN_RE = re.compile(r"^\d+\.\d+\.")    # "pkg@1.2.3...."
+# Leftovers glued to the local part: URL escapes ("%20sales@") and JSON
+# escapes whose backslash the regex skipped ("u003einfo@").
+_EMAIL_PREFIX_JUNK_RE = re.compile(r"^(?:%[0-9a-f]{2}|\\?u00(?:3c|3e|22|27|26|2f|20|40))+", re.I)
+_U_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
 PHONE_RE = re.compile(
     r"(?<![\w/#])(?:\+\s?\d{1,3}[\s.\-]?)?(?:\(\s?\d{1,5}\s?\)|\d{1,5})"
     r"(?:[\s.\-]?\d{2,5}){2,4}(?![\w])"
@@ -180,6 +213,16 @@ def json_ld_same_as(doc) -> list[str]:
     return out
 
 
+def _flatten_ld(v) -> list[str]:
+    """A JSON-LD value that may be a string, a number or (nested) lists of
+    them, as a flat list of strings."""
+    if isinstance(v, list):
+        return [s for item in v for s in _flatten_ld(item)]
+    if isinstance(v, (str, int, float)) and not isinstance(v, bool):
+        return [str(v)]
+    return []
+
+
 def parse_json_ld(doc) -> dict:
     out: dict = {}
     for script in dom.scripts_with_type(doc):
@@ -202,10 +245,19 @@ def parse_json_ld(doc) -> dict:
             if obj.get("legalName") and not out.get("name"):
                 out["name"] = clean_text(str(obj.get("legalName")))
             if obj.get("email") and not out.get("email"):
-                out["email"] = clean_text(str(obj["email"]).replace("mailto:", "")).lower()
+                # raw candidates: extract_company cleans them with the rest
+                emails: list[str] = []
+                for v in _flatten_ld(obj["email"]):
+                    v = re.sub(r"(?i)^\s*mailto:", "", unquote(v))
+                    emails.extend(find_emails(v[:500]))
+                if emails:
+                    out["email"] = emails
             if obj.get("telephone") and not out.get("phone"):
-                tel = obj["telephone"]
-                out["phone"] = clean_text(str(tel[0] if isinstance(tel, list) else tel))
+                tels = [clean_text(re.sub(r"(?i)^\s*tel:", "", unquote(v)))
+                        for v in _flatten_ld(obj["telephone"])]
+                tels = [t for t in tels if t]
+                if tels:
+                    out["phone"] = tels
             if obj.get("address") and not out.get("address"):
                 out["address"] = _format_ld_address(obj["address"])
             if obj.get("description") and not out.get("description"):
@@ -232,11 +284,58 @@ def clean_title(title: str) -> str:
 def extract_emails(doc, text: str, raw_html: str) -> list[str]:
     found: list[str] = []
     for href in dom.hrefs_starting(doc, "mailto:"):
-        addr = unquote(href[7:].split("?")[0])
+        addr = unquote(href[7:].split("?")[0]).strip()
         found.extend(EMAIL_RE.findall(addr[:500]))
     found.extend(find_emails(text[:MAX_SCAN_CHARS]))
-    found.extend(find_emails(raw_html[:MAX_SCAN_CHARS]))
+    found.extend(find_emails(_unescape(raw_html[:MAX_SCAN_CHARS])))
     return clean_emails(found)
+
+
+def _unescape(s: str) -> str:
+    """Decode JSON \\uXXXX escapes and HTML entities in raw page source, so
+    '\\u003cp\\u003einfo@acme.com' and 'info&#64;acme.com' scan cleanly."""
+    if "\\u" in s:
+        s = _U_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), s)
+    if "&" in s:
+        s = html.unescape(s)
+    return s
+
+
+def _tidy_email(e: str) -> str:
+    """One regex match as a bare, lower-cased address ("" when nothing valid
+    is left)."""
+    e = re.sub(r"(?i)^\s*mailto:", "", e.strip())
+    e = _EMAIL_PREFIX_JUNK_RE.sub("", e)
+    local, _, domain = e.rpartition("@")
+    labels = domain.split(".")
+    # "info@acme.com.Call us": a missing space after the sentence's period
+    # made the next word the TLD. Lower-case labels (acme.co.uk) are kept.
+    if (len(labels) >= 3 and labels[-1][:1].isupper() and not labels[-1].isupper()
+            and labels[-2].isalpha() and labels[-2].islower()):
+        domain = ".".join(labels[:-1])
+    e = f"{local}@{domain}".strip(".-_").lower()
+    return e if EMAIL_RE.fullmatch(e) else ""
+
+
+def _junk_email(e: str) -> bool:
+    """Placeholders, trackers, no-reply and asset names ("logo@2x.png")."""
+    if len(e) > 80 or e in PLACEHOLDER_EMAILS:
+        return True
+    local, _, domain = e.rpartition("@")
+    labels = domain.split(".")
+    if local in BAD_EMAIL_LOCALS:
+        return True
+    if re.sub(r"[._\-]", "", local).startswith(BAD_EMAIL_LOCAL_PREFIXES):
+        return True
+    if local.rsplit(".", 1)[-1] in ASSET_EXTS and "." in local:
+        return True
+    if labels[-1] in ASSET_EXTS or any(_RETINA_LABEL_RE.match(x) for x in labels):
+        return True
+    if _VERSION_DOMAIN_RE.match(domain):
+        return True
+    if domain in BAD_EMAIL_DOMAINS or any(x in BAD_EMAIL_LABELS for x in labels[:-1]):
+        return True
+    return any(domain == d or domain.endswith("." + d) for d in BAD_EMAIL_DOMAIN_SUFFIXES)
 
 
 def clean_emails(found: list[str]) -> list[str]:
@@ -244,8 +343,8 @@ def clean_emails(found: list[str]) -> list[str]:
     removed; at most 3."""
     out: list[str] = []
     for e in found:
-        e = e.strip(".-_").lower()
-        if len(e) > 80 or any(b in e for b in BAD_EMAIL_PARTS):
+        e = _tidy_email(e)
+        if not e or _junk_email(e):
             continue
         if e not in out:
             out.append(e)
@@ -362,14 +461,17 @@ def extract_company(doc, raw_html: str, url: str) -> Extracted:
         or clean_title(title) or norm_domain(url)
     )[:150]
     text = dom.text(doc, "\n")[:MAX_SCAN_CHARS]
-    ex.email = extract_emails(doc, text, raw_html)
-    if ld.get("email") and ld["email"] not in ex.email:
-        ex.email.insert(0, ld["email"])
+    # JSON-LD emails first, through the same junk filter and the same cap
+    ex.email = clean_emails(ld.get("email", []) + extract_emails(doc, text, raw_html))
     ex.phone = extract_phones(doc, text)
-    if ld.get("phone"):
-        v = _valid_phone(ld["phone"])
-        if v and v not in ex.phone:
+    for tel in ld.get("phone", []):
+        v = _valid_phone(tel)
+        if v:
+            # same number written differently: keep the JSON-LD form, once
+            key = re.sub(r"\D", "", v)
+            ex.phone = [p for p in ex.phone if re.sub(r"\D", "", p) != key]
             ex.phone.insert(0, v)
+            break
     ex.address = ld.get("address") or extract_address(doc, text)
     ex.services = build_services(doc, ld.get("description", ""))
     return ex
