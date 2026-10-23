@@ -51,7 +51,7 @@ from .. import config, fastjson
 from . import analysis, emailcheck
 from .categories import (CATEGORIES, cities_for, custom_terms, expansion_phrases, keyword_terms,
                          search_phrases, slugify_custom)
-from .crawler import Fetcher, social_profile
+from .crawler import Fetcher, is_about_url, social_profile
 from .credits import CreditLedger, ledger_key
 from .deduplicator import DedupRegistry
 from .discovery import TIER_HELP, DiscoveryPlanner, SearchRequest
@@ -60,7 +60,7 @@ from .extractor import Extracted, clean_emails, find_emails, split_address
 from .geo import expansion_geos, find_state, nearby_geos, state_of_city
 from .prio_pool import PriorityThreadPool
 from .normalize import clean_text, norm_domain, norm_name
-from .search import ProviderDisabled, account_limits, make_provider
+from .search import ProviderDisabled, account_limits, make_bing_provider, make_provider
 from .validator import confidence, is_aggregator, is_skip_domain, record_status, validate
 
 log = logging.getLogger("engine")
@@ -634,7 +634,10 @@ class CollectionJob:
             "candidate_urls": 0, "unique_domains": 0, "tasks_done": 0,
             "search_results": 0, "new_results": 0, "skipped_known": 0,
             "searches_done": 0,
-            "social_lookups": 0, "social_emails": 0,
+            "social_lookups": 0, "social_emails": 0, "about_pages": 0,
+            # Bing (SerpApi) - separate from the Serper credits above
+            "bing_searches": 0, "bing_results": 0, "bing_new": 0, "valid_bing": 0,
+            "bing_failed": 0, "bing_social_emails": 0,
             # fault tolerance
             "search_failures": 0, "search_retries": 0, "searches_failed": 0,
             "worker_errors": 0, "abandoned_tasks": 0, "pool_restarts": 0,
@@ -696,6 +699,8 @@ class CollectionJob:
         self.fetcher = Fetcher()
         self.fetcher.timings = self.timings
         self.provider = None
+        self.bing = None                 # BingProvider, when BING_API_KEY is set
+        self._bing_off = ""              # why Bing stopped for this run
         self.serper_key = ""             # owner's own Serper key; "" = server's
         self.planner: DiscoveryPlanner | None = None
         self._pool: PriorityThreadPool | None = None
@@ -921,6 +926,8 @@ class CollectionJob:
         self._last_new_record = time.time()
         self._bump("valid")
         self._bump(f"valid_{kind}")
+        if record.get("Found Via") == "Bing":
+            self._bump("valid_bing")
         if lk:   # credit ledger: this search produced one more valid record
             self.state.ledger.attribute_valid(lk)
         if self.planner is not None:
@@ -1051,7 +1058,7 @@ class CollectionJob:
             items = p.organic_items(query)
         except Exception as exc:   # out of credits / network: skip, never fatal
             self.say(f"Social page lookup failed for {firm[:50]}: {str(exc)[:80]}")
-            return [], ""
+            return self._social_email_bing(socials, query)
         credits = int(getattr(p, "last_credits", 1))
         self._sync_provider_counters()
         self._bump("social_lookups")
@@ -1073,7 +1080,53 @@ class CollectionJob:
                 self._bump("social_emails")
                 self.say(f"Email found on social page {link[:80]}: {emails[0]}")
                 return emails, link
+        return self._social_email_bing(socials, query)
+
+    def _social_email_bing(self, socials: list[str], query: str) -> tuple[list[str], str]:
+        """Google showed no email for the firm's social pages: the same
+        lookup on Bing, which often shows the email of a Facebook page's
+        About section. Same rule - only the profile itself or its About page
+        counts. Returns (emails, profile URL)."""
+        items = self._bing_call(lambda b: b.organic_items(query), query)
+        wanted = set(socials)
+        for it in items or []:
+            link = str(it.get("link") or "")
+            if social_profile(link, page_only=True) not in wanted:
+                continue
+            text = " ".join(str(it.get(k) or "") for k in ("title", "snippet"))
+            emails = clean_emails(find_emails(text[:5000]))
+            if emails:
+                self._bump("social_emails")
+                self._bump("bing_social_emails")
+                self.say(f"Email found on social page via Bing {link[:80]}: {emails[0]}")
+                return emails, link
         return [], ""
+
+    def _bing_call(self, fn, query: str):
+        """One Bing (SerpApi) search within this run's Bing cap. None when
+        Bing is off, capped or failing - never raises: Bing only adds."""
+        b = self.bing
+        if b is None or self._bing_off or self.done():
+            return None
+        with self.lock:
+            cap = config.BING_MAX_SEARCHES_PER_RUN
+            capped = bool(cap and self.counters["bing_searches"] >= cap)
+            if capped:
+                self._bing_off = f"Bing search cap reached ({cap} searches per run)"
+            else:
+                self.counters["bing_searches"] += 1
+        if capped:
+            self.say(f"Bing: {self._bing_off} - continuing with Google only")
+            return None
+        try:
+            return fn(b)
+        except ProviderDisabled as exc:
+            self._bing_off = str(exc)[:160]
+            self.say(f"Bing switched off for this run: {self._bing_off}")
+        except Exception as exc:
+            self._bump("bing_failed")
+            self.say(f"Bing search failed for \"{query[:60]}\": {str(exc)[:100]}")
+        return None
 
     def _split_geo(self, address: str) -> tuple[str, str, str]:
         """Parse city/state/country from the address; blanks fall back to the
@@ -1131,8 +1184,50 @@ class CollectionJob:
                 return True
         return not self.state.mark_crawled(key, self.category)
 
+    @staticmethod
+    def _facebook_page(socials: list[str]) -> str:
+        """The firm's own Facebook page URL from its social links, or ""."""
+        fb = next((s for s in socials if s.startswith("facebook.com/")), "")
+        return f"https://www.{fb}" if fb else ""
+
+    def _follow_pages(self, links: list[str], data, socials: list[str],
+                      complete: bool, n: int):
+        """Read up to n contact / About Us pages of a firm's site, merging
+        what is missing (emails are added up to 3) and the social links found
+        there. With ABOUT_PAGE_CRAWL the About Us page is read even when the
+        homepage was complete. Returns (page that gave the email, page that
+        changed the data) - "" where none did."""
+        links = list(links or [])[:n]
+        about = (next((u for u in links if is_about_url(u)), "")
+                 if config.ABOUT_PAGE_CRAWL else "")
+        if complete:
+            links = [about] if about else []
+        email_page = changed_page = ""
+        for cp in links:
+            if self.done():
+                break
+            r2, fu2, _ = self._fetch_analyze(cp, contact_links=False)
+            if r2 is None or r2.get("blocked"):
+                continue
+            if cp == about:
+                self._bump("about_pages")
+            before = (len(data.email), bool(data.phone), bool(data.address))
+            had_email = bool(data.email)
+            data.merge_missing(self._to_extracted(r2))
+            socials += [s for s in r2.get("social") or [] if s not in socials]
+            if data.email and not had_email:
+                email_page = fu2
+                if cp == about:
+                    self.say(f"Email found on About Us page {fu2[:80]}: {data.email[0]}")
+            if (len(data.email), bool(data.phone), bool(data.address)) != before:
+                changed_page = changed_page or fu2
+            if (data.email and data.phone and data.address
+                    and (not about or cp == about)):
+                break
+        return email_page, changed_page
+
     def crawl_site(self, url: str, query: str, allow_mining: bool,
-                   lk: str = "") -> list[str]:
+                   lk: str = "", via: str = "Google") -> list[str]:
         """Crawl one discovered site; may add a record. Returns directory-mined
         candidate URLs."""
         if self.done() or self._mark_attempted(url):
@@ -1167,25 +1262,15 @@ class CollectionJob:
         source_page = final_url
         email_source = final_url if data.email else ""
         # Homepage already has email + phone (+ address, unless
-        # CONTACT_PAGES_FOR_ADDRESS is off): stop, no more pages. Otherwise
-        # follow at most 2 contact/about links, stopping early.
-        if not (data.email and data.phone
-                and (data.address or not config.CONTACT_PAGES_FOR_ADDRESS)):
-            for cp in (res.get("contact_links") or [])[:2]:
-                if self.done():
-                    break
-                r2, fu2, _ = self._fetch_analyze(cp, contact_links=False)
-                if r2 is None or r2.get("blocked"):
-                    continue
-                before = (bool(data.email), bool(data.phone), bool(data.address))
-                data.merge_missing(self._to_extracted(r2))
-                socials += [s for s in r2.get("social") or [] if s not in socials]
-                if data.email and not before[0]:
-                    email_source = fu2
-                if (bool(data.email), bool(data.phone), bool(data.address)) != before:
-                    source_page = fu2
-                if data.email and data.phone and data.address:
-                    break
+        # CONTACT_PAGES_FOR_ADDRESS is off): only its About Us page is read
+        # (more email IDs, the Facebook page link). Otherwise follow at most
+        # 2 pages - the Contact page, then the About Us page - stopping early.
+        complete = bool(data.email and data.phone
+                        and (data.address or not config.CONTACT_PAGES_FOR_ADDRESS))
+        email_page, changed_page = self._follow_pages(
+            res.get("contact_links"), data, socials, complete, 2)
+        email_source = email_page or email_source
+        source_page = changed_page or source_page
 
         if not data.email and socials:
             emails, page = self._social_email(socials[:3], data.name or norm_domain(final_url))
@@ -1203,11 +1288,13 @@ class CollectionJob:
             "Official Website": website,
             "Business Email": "; ".join(data.email),
             "Email Source": email_source if data.email else "",
+            "Facebook Page": self._facebook_page(socials),
             "Business Phone": "; ".join(data.phone),
             "Full Business Address": data.address,
             "City": city, "State": state_, "Country": country,
             "Industry": self.display,
             "Services": data.services,
+            "Found Via": via,
             "Source URL": url,
             "Source Page": source_page,
             "_lk": lk,
@@ -1230,6 +1317,7 @@ class CollectionJob:
         services = industry
         site_url = ""
         source_page = ""
+        socials: list[str] = []
         if website.lower().startswith("http") and not is_skip_domain(website):
             p = urlparse(website)
             site_url = f"{p.scheme}://{p.netloc.lower()}"
@@ -1245,17 +1333,13 @@ class CollectionJob:
                         source_page = final_url
                         email_source = final_url if data.email else ""
                         # Places already supplied phone + address; only chase
-                        # the email, via at most one contact page, then the
-                        # firm's own social media profiles.
-                        if not data.email:
-                            for cp in (res.get("contact_links") or [])[:1]:
-                                r2, fu2, _ = self._fetch_analyze(cp, contact_links=False)
-                                if r2 is not None and not r2.get("blocked"):
-                                    data.merge_missing(self._to_extracted(r2))
-                                    socials += [s for s in r2.get("social") or []
-                                                if s not in socials]
-                                    if data.email:
-                                        source_page = email_source = fu2
+                        # the email - the Contact and About Us pages, then the
+                        # firm's own social media profiles. (The About Us page
+                        # is read anyway, for the Facebook page link.)
+                        email_page, _ = self._follow_pages(
+                            res.get("contact_links"), data, socials, bool(data.email), 2)
+                        if email_page:
+                            source_page = email_source = email_page
                         if not data.email and socials:
                             emails, page = self._social_email(socials[:3], title)
                             if emails:
@@ -1273,11 +1357,13 @@ class CollectionJob:
             "Official Website": site_url,
             "Business Email": "; ".join(email),
             "Email Source": email_source if email else "",
+            "Facebook Page": self._facebook_page(socials),
             "Business Phone": clean_text(place.get("phoneNumber")),
             "Full Business Address": address,
             "City": city, "State": state_, "Country": country,
             "Industry": industry or self.display,
             "Services": services[:500],
+            "Found Via": "Google Maps",
             "Source URL": f"https://www.google.com/maps?cid={cid}" if cid else "google places",
             "Source Page": source_page,
             "_cid": cid,
@@ -1359,15 +1445,16 @@ class CollectionJob:
         with self._inflight_lock:
             return len(self._inflight)
 
-    def _submit_crawl(self, url: str, query: str, allow_mining: bool, lk: str = ""):
+    def _submit_crawl(self, url: str, query: str, allow_mining: bool, lk: str = "",
+                      via: str = "Google"):
         def mine(candidates):
             for u in (candidates or []):
                 if self.done():
                     return
                 if self._claim_result(norm_domain(u)):
-                    self._submit_crawl(u, query, False, lk)
+                    self._submit_crawl(u, query, False, lk, via)
         if self._submit_task("crawl", url, query, self.crawl_site, url, query,
-                             allow_mining, lk,
+                             allow_mining, lk, via,
                              on_result=mine if allow_mining else None,
                              prio=PRIO_RESULT if allow_mining else PRIO_MINED) is not None:
             self._bump("candidate_urls")
@@ -1465,7 +1552,8 @@ class CollectionJob:
         with self.state.lock:
             return ident not in self.state.crawled
 
-    def _process_organic(self, urls: list[str], req: SearchRequest, lk: str = "") -> int:
+    def _process_organic(self, urls: list[str], req: SearchRequest, lk: str = "",
+                         via: str = "Google") -> int:
         new = 0
         for u in urls:
             if is_skip_domain(u) and not is_aggregator(u):
@@ -1474,8 +1562,48 @@ class CollectionJob:
                 self._bump("skipped_known")
                 continue
             new += 1
-            self._submit_crawl(u, req.query, True, lk)
+            self._submit_crawl(u, req.query, True, lk, via)
         return new
+
+    def _bing_search(self, req: SearchRequest):
+        """Repeat a Google search on Bing (same query; same page for organic
+        pages, page 1 for Places). Results go through the same dedup, so a
+        firm Google already returned is never crawled twice - what remains
+        is what only Bing found. Responses are cached like Serper's, so the
+        same Bing search is never paid for twice."""
+        if self.bing is None or self._bing_off or self.done():
+            return
+        if req.kind != "organic" and req.page > 1:
+            return
+        page = req.page if req.kind == "organic" else 1
+        key = ledger_key("bing", req.query, page)
+        urls = self.state.cache_get(key)
+        source = "cached, 0 Bing searches"
+        if urls is None:
+            with self._sf_lock:          # this search is already on the wire
+                if key in self._search_inflight:
+                    return
+                self._search_inflight[key] = ev = threading.Event()
+            try:
+                urls = self._bing_call(lambda b: b.organic_page(req.query, page), req.query)
+                if urls is None:
+                    return
+                self.state.cache_put(key, list(urls))
+                source = "1 Bing search"
+            finally:
+                with self._sf_lock:
+                    self._search_inflight.pop(key, None)
+                ev.set()
+        try:
+            new = self._process_organic(list(urls), req, "", via="Bing")
+        except Exception as exc:
+            self._worker_error({"op": "process_bing_results",
+                                "query": req.query, "url": ""}, exc)
+            return
+        self._bump("bing_results", len(urls))
+        self._bump("bing_new", new)
+        self.say(f"Bing results for \"{req.query[:60]}\": {len(urls)} "
+                 f"({new} new, not found on Google; {source})")
 
     def _process_places(self, places: list[dict], req: SearchRequest, lk: str = "") -> int:
         new = 0
@@ -1613,6 +1741,7 @@ class CollectionJob:
         cost = f"{credits} credit" if source == "api" else "cached, 0 credits"
         self.say(f"{req.kind.title()} results for \"{req.query[:60]}\": "
                  f"{len(results)} ({new} new, {dup} already known; {cost})")
+        self._bing_search(req)
 
     # -- credit-aware scheduling ---------------------------------------------
     def _want_organic(self) -> bool:
@@ -1815,6 +1944,7 @@ class CollectionJob:
                     elif kind == "timeout":
                         self._bump("serper_timeouts")
                 self.provider.on_event = _ev
+            self._start_bing()
             self.planner = self._make_planner()
             self._preflight_credits()
             self.say(f"Job started: {self.display} | target {self.target} | "
@@ -1858,6 +1988,26 @@ class CollectionJob:
                     cb(self)
                 except Exception:
                     log.exception("job finish callback failed")
+
+    def _start_bing(self):
+        """Bing next to Google when BING_SEARCH is on and BING_API_KEY is set."""
+        if not config.BING_SEARCH:
+            return
+        try:
+            self.bing = make_bing_provider()
+        except ProviderDisabled as exc:
+            self.bing = None
+            self.say(f"Bing search not available: {exc}")
+            return
+        if self.bing is None:
+            self.say("Bing search not configured (set BING_API_KEY in app/.env) - "
+                     "searching Google only")
+            return
+        left = self.bing.balance()
+        self.say("Bing search on: every Google search is repeated on Bing"
+                 + (f" ({left} SerpApi searches left)" if left is not None else "")
+                 + (f", at most {config.BING_MAX_SEARCHES_PER_RUN} this run"
+                    if config.BING_MAX_SEARCHES_PER_RUN else ""))
 
     def _new_crawl_pool(self) -> PriorityThreadPool:
         return PriorityThreadPool(
@@ -2088,6 +2238,13 @@ class CollectionJob:
             self.state.discovery[self.memory_key] = self.planner.export()
         self._log_slowest()
         self._log_credits()
+        if self.bing is not None:
+            c = self.counters
+            self.say(f"Bing: {c['bing_searches']} searches -> {c['bing_results']} results, "
+                     f"{c['bing_new']} not found on Google, {c['valid_bing']} valid records, "
+                     f"{c['bing_social_emails']} social-page emails")
+        if c_about := self.counters["about_pages"]:
+            self.say(f"About Us pages read: {c_about}")
         self._wait_email_checks()
         summary = self._finalize_outputs()
         n = self.category_count()

@@ -31,6 +31,7 @@ CONTACT_LINK_RE = re.compile(
     r"contact|about|reach-?us|get-?in-?touch|locations?|offices?|find-?us|"
     r"visit-?us", re.I
 )
+ABOUT_LINK_RE = re.compile(r"about|who-?we-?are|our-?(story|company|team)", re.I)
 MAX_CANDIDATES_PER_PAGE = 60
 MAX_REDIRECTS = 5
 crawl_log = logging.getLogger("crawler")
@@ -235,14 +236,25 @@ class Fetcher:
         return doc, raw.decode("utf-8", "replace"), final_url, ""
 
 
+def is_about_url(url: str) -> bool:
+    """An About Us page of a site ("/about-us", "/who-we-are", ...)."""
+    return bool(ABOUT_LINK_RE.search(urlparse(url).path))
+
+
 def find_contact_links(doc, base_url: str) -> list[str]:
+    """Same-site contact / about pages: the best Contact page first, then the
+    best About Us page (firms often list their email IDs and Facebook page
+    there), then the rest."""
     base_root = root_domain(base_url)
     out: list[str] = []
+    about: set[str] = set()
     for a in dom.anchors(doc):
         href = a.get("href").strip()
         if href.lower().startswith(("mailto:", "tel:", "javascript:", "#")):
             continue
-        if CONTACT_LINK_RE.search(href) or CONTACT_LINK_RE.search(dom.text(a, " ")):
+        label = dom.text(a, " ")
+        if (CONTACT_LINK_RE.search(href) or CONTACT_LINK_RE.search(label)
+                or ABOUT_LINK_RE.search(href) or ABOUT_LINK_RE.search(label)):
             full = urljoin(base_url, href).split("#")[0]
             if not full.lower().startswith("http"):
                 continue
@@ -253,7 +265,13 @@ def find_contact_links(doc, base_url: str) -> list[str]:
             if re.search(r"\.(pdf|jpg|png|zip|docx?)$", full, re.I):
                 continue
             out.append(full)
+            if ABOUT_LINK_RE.search(full) or ABOUT_LINK_RE.search(label):
+                about.add(full)
     out.sort(key=lambda u: 0 if "contact" in u.lower() else 1)
+    first_about = next((u for u in out if u in about and "contact" not in u.lower()), "")
+    if first_about:
+        out.remove(first_about)
+        out.insert(1 if out and "contact" in out[0].lower() else 0, first_about)
     return out
 
 
