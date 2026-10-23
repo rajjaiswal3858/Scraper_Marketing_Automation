@@ -1,7 +1,8 @@
 """Search provider abstraction. Serper.dev (Google organic + Places) is the
-only implemented provider; add another by subclassing SearchProvider and
-registering it in PROVIDERS. Ported from business_collector.py's Serper client
-(429 backoff, 401/403/credit detection, credit accounting)."""
+main provider; BingProvider (SerpApi, engine=bing) runs beside it as a second
+source. Add another by subclassing SearchProvider and registering it in
+make_provider. Ported from business_collector.py's Serper client (429
+backoff, 401/403/credit detection, credit accounting)."""
 
 from __future__ import annotations
 
@@ -473,6 +474,122 @@ def _serper_session() -> requests.Session:
     s.mount("https://", adapter)
     s.headers.update({"Content-Type": "application/json"})
     return s
+
+
+class BingProvider:
+    """Bing web results through SerpApi (engine=bing): Microsoft retired its
+    own Bing Search API in 2025. Runs NEXT TO the Serper provider - every
+    Google search is repeated once on Bing, whose results reach firms that
+    Google ranks low. Separate key, credits and counters: Bing never spends
+    Serper credits, and a Bing failure never stops the Google search."""
+
+    name = "bing"
+    SEARCH_URL = "https://serpapi.com/search.json"
+    ACCOUNT_URL = "https://serpapi.com/account.json"
+    ATTEMPTS = 2
+
+    def __init__(self, api_key: str):
+        if not api_key:
+            raise ProviderDisabled("No Bing key (BING_API_KEY in app/.env).")
+        self.api_key = api_key
+        self.session = requests.Session()
+        self.session.mount("https://", SharedTLSAdapter(pool_connections=1,
+                                                        pool_maxsize=8))
+        self.slots = threading.BoundedSemaphore(config.BING_CONCURRENCY)
+        self.requests_made = 0
+        self.ok_count = 0
+        self.fail_count = 0
+        self.disabled_reason = ""
+        self.lock = threading.Lock()
+
+    def _get(self, params: dict) -> dict:
+        if self.disabled_reason:
+            raise ProviderDisabled(self.disabled_reason)
+        params = {"engine": "bing", "api_key": self.api_key, **params}
+        last = ""
+        for attempt in range(self.ATTEMPTS):
+            if attempt:
+                time.sleep(1.0 + random.uniform(0, 1.0))
+            t0 = time.time()
+            try:
+                with self.slots:
+                    resp = self.session.get(self.SEARCH_URL, params=params,
+                                            timeout=config.SERPER_TIMEOUT)
+            except requests.RequestException as exc:
+                last = f"network error: {str(exc)[:100]}"
+                continue
+            with self.lock:
+                self.requests_made += 1
+            status = resp.status_code
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+            err = str(data.get("error") or "") if isinstance(data, dict) else ""
+            log.info("bing   q=%r first=%s dur=%dms status=%s results=%d",
+                     params.get("q", ""), params.get("first", 1),
+                     (time.time() - t0) * 1000, status,
+                     len(data.get("organic_results") or []) if isinstance(data, dict) else 0)
+            if status == 200 and isinstance(data, dict) and not err:
+                with self.lock:
+                    self.ok_count += 1
+                return data
+            if status == 200 and "hasn't returned any results" in err:
+                return {}       # SerpApi's answer for an empty result page
+            with self.lock:
+                self.fail_count += 1
+            # 429 is also SerpApi's hourly throughput limit (retried); only
+            # "run out of searches" means the plan is used up
+            if status in (401, 403) or (status == 429 and "run out" in err.lower()):
+                self.disabled_reason = f"Bing (SerpApi) HTTP {status}: {err[:160]}"
+                raise ProviderDisabled(self.disabled_reason,
+                                       "auth" if status in (401, 403) else "credits")
+            last = f"HTTP {status}: {err[:120]}"
+            if status not in RETRYABLE_STATUS:
+                break
+        raise SearchError(f"bing: {last}")
+
+    def organic_page(self, query: str, page: int = 1) -> list[str]:
+        """One page (10) of Bing web result URLs (1 SerpApi search)."""
+        params = {"q": query, "count": 10}
+        if page > 1:
+            params["first"] = (page - 1) * 10 + 1
+        data = self._get(params)
+        return [i["link"] for i in self.organic_items_from(data)
+                if str(i.get("link", "")).startswith("http")]
+
+    def organic_items(self, query: str) -> list[dict]:
+        """Full Bing results (title, link, snippet) for one query."""
+        return self.organic_items_from(self._get({"q": query, "count": 10}))
+
+    @staticmethod
+    def organic_items_from(data: dict) -> list[dict]:
+        seen: set[str] = set()
+        out = []
+        for i in data.get("organic_results") or []:
+            if isinstance(i, dict) and i.get("link") and i["link"] not in seen:
+                seen.add(i["link"])
+                out.append(i)
+        return out
+
+    def balance(self) -> int | None:
+        """Searches left on the SerpApi plan (costs no search)."""
+        try:
+            r = self.session.get(self.ACCOUNT_URL, params={"api_key": self.api_key},
+                                 timeout=config.SERPER_TIMEOUT)
+            if r.status_code == 200:
+                return int(r.json().get("total_searches_left"))
+        except (requests.RequestException, ValueError, TypeError):
+            pass
+        return None
+
+
+def make_bing_provider() -> BingProvider | None:
+    """The Bing provider when BING_SEARCH is on and a key is set, else None."""
+    key = config.bing_api_key()
+    if not config.BING_SEARCH or not key:
+        return None
+    return BingProvider(key)
 
 
 def make_provider(name: str, serper_key: str) -> SearchProvider:

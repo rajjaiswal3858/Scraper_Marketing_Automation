@@ -239,6 +239,17 @@ EXPECTED_RECORDS_PER_CREDIT = _float_env("EXPECTED_RECORDS_PER_CREDIT", 2.5, 0.1
 # X / LinkedIn profiles: one Serper search (1 credit) reads the email Google
 # shows for those exact profiles. 0 turns it off.
 SOCIAL_EMAIL_LOOKUP = _int_env("SOCIAL_EMAIL_LOOKUP", 1, 0, 1)
+# Also read each firm's About Us page (email IDs, Facebook page link), even
+# when the homepage already had an email + phone. One extra page per firm.
+ABOUT_PAGE_CRAWL = _int_env("ABOUT_PAGE_CRAWL", 1, 0, 1)
+
+# Bing as a second search engine, through SerpApi (engine=bing; set
+# BING_API_KEY in app/.env). Every Google search is repeated once on Bing;
+# Bing also gets a turn at a firm's social pages when Google shows no email.
+# BING_MAX_SEARCHES_PER_RUN caps the SerpApi searches one collection spends.
+BING_SEARCH = _int_env("BING_SEARCH", 1, 0, 1)
+BING_CONCURRENCY = _int_env("BING_CONCURRENCY", 3, 1, 10)
+BING_MAX_SEARCHES_PER_RUN = _int_env("BING_MAX_SEARCHES_PER_RUN", 200, 0, 100_000)
 
 # A city search that runs out of results may widen to its state's other
 # cities (they are then filed under the searched city). Off: every result
@@ -402,6 +413,14 @@ def serper_api_key() -> str:
         elif from_file:                  # the key line was removed / emptied
             os.environ.pop("SERPER_API_KEY", None)
     return os.environ.get("SERPER_API_KEY", "").strip()
+
+
+def bing_api_key() -> str:
+    """The SerpApi key used for Bing searches: a real environment variable,
+    else app/.env (re-read, so a key added there works without a restart)."""
+    if "BING_API_KEY" in os.environ and "BING_API_KEY" not in _DOTENV_KEYS:
+        return os.environ["BING_API_KEY"].strip()
+    return _dotenv_cached().get("BING_API_KEY", "").strip()
 
 
 def job_crawl_workers(in_use: int = 0) -> int:

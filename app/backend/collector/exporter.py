@@ -26,9 +26,9 @@ log = logging.getLogger("exporter")
 
 COLUMNS = [
     "Company Name", "Category", "Subcategory", "Official Website",
-    "Business Email", "Email Score", "Email Check", "Email Source",
+    "Business Email", "Email Score", "Email Check", "Email Source", "Facebook Page",
     "Business Phone", "Country", "State", "City",
-    "Full Business Address", "Industry", "Services", "Source URL",
+    "Full Business Address", "Industry", "Services", "Found Via", "Source URL",
     "Source Page", "Search Query", "Collected At", "Confidence Score", "Record Status",
 ]
 
@@ -238,8 +238,8 @@ def _layout(records: list[dict], display: str) -> list[tuple[str, list[tuple[str
 
 def _fill_sheet(ws, sections: list[tuple[str, list[list[str]]]]):
     ws.append(COLUMNS)
-    url_cols = [_COL[c] + 1 for c in ("Official Website", "Email Source", "Source URL",
-                                      "Source Page")]
+    url_cols = [_COL[c] + 1 for c in ("Official Website", "Email Source", "Facebook Page",
+                                      "Source URL", "Source Page")]
     email_col = _COL["Business Email"] + 1
     date_col = _COL["Collected At"] + 1
     ncol = len(COLUMNS)

@@ -18,7 +18,7 @@ SEARCH ──> DISCOVER ──> CRAWL ──> EXTRACT ──> SOCIAL FALLBACK �
 | Feature | What it does |
 |---|---|
 | **Multi-user** | Accounts with login; every user has their own records, jobs, Excel files and (optionally) their own Serper key. Several users collect at the same time; extra jobs queue. |
-| **Multi-source** | Google organic results + Google Places (Maps) listings, business websites (homepage + contact pages), directory/list pages, and the business's **own Facebook / Instagram / X / LinkedIn** profiles when its website shows no email. |
+| **Multi-source** | Google organic results + Google Places (Maps) listings, **Bing** web results (via SerpApi, optional), business websites (homepage + contact + **About Us** pages, with the firm's **Facebook page** saved), directory/list pages, and the business's **own Facebook / Instagram / X / LinkedIn** profiles when its website shows no email. |
 | **Advanced search** | Fixed categories (Finance, Law Firms, RPO, …) or any custom category; **multiple keywords**, including multi-word phrases (`Business development executive`); **custom record targets from 1 to 10,000** with a live Serper-credit estimate. |
 | **Location-based** | Country / state / city search. Each search location is its own search: own target, own results, never mixed with an earlier search in another place. |
 | **Excel management** | One workbook per category, **one sheet per state**, a **heading per searched location** (a later city search is appended below the state's results), duplicates blocked, existing records never altered or removed. |
@@ -82,7 +82,10 @@ The most important settings — see [`app/.env.example`](app/.env.example) for a
 | `MAX_ACTIVE_JOBS` | Collections running at the same time |
 | `MAX_CREDITS_PER_RECORD` / `MAX_CREDITS_PER_IP_PER_DAY` | Spending safety caps |
 | `EMAIL_VERIFY`, `EMAIL_SMTP_CHECK`, `EMAIL_VERIFY_FROM` | Email verification on/off, mailbox-check mode (`auto` / `on` / `off`), probe sender |
-| `SOCIAL_EMAIL_LOOKUP` | Look up emails on the business's own social profiles (1 credit each) |
+| `SOCIAL_EMAIL_LOOKUP` | Look up emails on the business's own social profiles (1 credit each; Bing gets a second try) |
+| `ABOUT_PAGE_CRAWL` | Always read the firm's About Us page for email IDs + its Facebook page (default 1) |
+| `BING_API_KEY` | SerpApi key: every Google search is repeated on Bing; Bing-only finds are marked "Bing" in **Found Via** |
+| `BING_MAX_SEARCHES_PER_RUN` | SerpApi searches one collection may use (default 200) |
 | `SEARCH_NEARBY_CITIES` | Let a city search widen to nearby cities (off by default) |
 
 > **Port 25:** the mailbox (SMTP) check needs outbound port 25. Most home
