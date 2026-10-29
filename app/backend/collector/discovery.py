@@ -48,10 +48,18 @@ finite, logged terminal condition (never an infinite loop).
 
 A failed search is re-queued with exponential backoff (bounded); one that
 still fails is recorded and re-tried once on the next run.
+
+Custom search queries (the user's own Google query strings) are FIXED cells:
+sent exactly as typed, never combined with a location, and issued before any
+phrase x location cell. One that is word-for-word the same as a phrase x
+location cell shares that cell's key, so the same search is never paid for
+twice. A query with Google operators (site:, "quotes", -term, OR ...) is
+searched organically only - Places ignores operators.
 """
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 import unicodedata
@@ -85,6 +93,9 @@ TIER_HELP = {
 }
 DEEP_PLACES_MAX_PAGE = 5
 DEEP_ORGANIC_MAX_PAGE = 3
+# The user's own custom queries are read further: alone they are the whole
+# search, and Google serves at most ~10 pages (100 results) per query.
+CUSTOM_ORGANIC_MAX_PAGE = 10
 RETRY_BASE_S = 5.0        # failed search re-queued after 5 s, 10 s, ...
 FAILED_MEMORY_MAX = 500
 CELLS_MEMORY_MAX = 20_000
@@ -129,6 +140,28 @@ def canon_geo(geo: str) -> str:
     return " ".join(_words(geo))
 
 
+def norm_query(query: str) -> str:
+    """Exact-query key: spacing and case only. Operators and quotes are
+    meaningful in a custom query, so nothing else is dropped. Google's
+    boolean operators are case-sensitive ("a OR b" is not "a or b"), so an
+    upper-case OR / AND keeps its case in the key."""
+    toks = unicodedata.normalize("NFKC", query or "").split()
+    return " ".join(t if t in ("OR", "AND") else t.casefold() for t in toks)
+
+
+# Google operators: quotes, -exclusion, upper-case OR / AND / AROUND(n) / "|"
+# (lower-case "and" / "or" are plain words), and the name: operators.
+_OPERATOR_RE = re.compile(
+    r'"|(?:^|\s)-\S|\s(?:OR|AND|\|)\s|\bAROUND\(\d+\)|(?i:\b(?:site|intitle|'
+    r'allintitle|inurl|allinurl|intext|allintext|inanchor|allinanchor|filetype|'
+    r'ext|related|before|after|source|location|loc|daterange|link):)')
+
+
+def has_operators(query: str) -> bool:
+    """True when the query uses Google search operators (Places ignores them)."""
+    return bool(_OPERATOR_RE.search(query or ""))
+
+
 @dataclass
 class SearchRequest:
     kind: str            # "places" | "organic"
@@ -144,7 +177,8 @@ class DiscoveryPlanner:
     def __init__(self, phrases: list[str], geos: list[str], saved: dict | None = None,
                  legacy_done: set[str] | None = None, places: bool = True,
                  max_page: int = 3, extra_phrases: list[str] | None = None,
-                 extra_geos: list[str] | None = None):
+                 extra_geos: list[str] | None = None,
+                 fixed_queries: list[str] | None = None):
         self.lock = threading.Lock()
         self.places = places
         self.max_page = max_page
@@ -159,6 +193,12 @@ class DiscoveryPlanner:
         self._gseen: set[str] = set()
         for g in geos:
             self._add_geo(g)
+        # the user's custom queries: (canon phrase, canon geo, exact text)
+        self.fixed: list[tuple[str, str, str]] = []
+        self.organic_only: set[str] = set()       # cell keys of operator queries
+        self.fixed_keys: set[str] = set()         # cell keys of custom queries
+        for q in fixed_queries or []:
+            self._add_fixed(q)
         # held back until the "expanded" tier
         self.extra_phrases = list(extra_phrases or [])
         self.extra_geos = list(extra_geos or [])
@@ -227,6 +267,28 @@ class DiscoveryPlanner:
         self.geos.append((c, g))
         return True
 
+    def _add_fixed(self, q: str) -> bool:
+        text = " ".join((q or "").split())
+        nq = norm_query(text)
+        if not nq or any(norm_query(t) == nq for _, _, t in self.fixed):
+            return False
+        # word-for-word a phrase x location cell: share its key (one search)
+        cp, cg = f"q:{nq}", ""
+        for pc, pd in self.phrases:
+            head = norm_query(pd) + " in "
+            if not nq.startswith(head):
+                continue
+            match = next((gc for gc, gd in self.geos
+                          if norm_query(self.query_text(pd, gd)) == nq), None)
+            if match is not None:
+                cp, cg = pc, match
+                break
+        self.fixed.append((cp, cg, text))
+        self.fixed_keys.add(self._cell_key(cp, cg))
+        if has_operators(text):
+            self.organic_only.add(self._cell_key(cp, cg))
+        return True
+
     # -- scoring -------------------------------------------------------------
     def _global_valid_rate(self) -> float:
         cr = sum(v[0] for v in self.pstat.values())
@@ -269,6 +331,17 @@ class DiscoveryPlanner:
                     self.retries_issued += 1
                     self._inflight(r, +1)
                     return [r]
+            # the user's own queries come first, exactly as typed
+            for cp, cg, text in self.fixed:
+                key = self._cell_key(cp, cg)
+                if key in self.used:
+                    continue
+                if text.lower() in self.legacy:      # executed by an older version
+                    self.used.add(key)
+                    self.skipped_used += 1
+                    continue
+                return self._issue_cell(cp, cg, text, UNTRIED_GEO,
+                                        want_organic, want_places)
             gvr = self._global_valid_rate()
             # base tier: only cells worth a credit; later tiers: any unused cell
             best, best_e = None, (MIN_EXPECTED if self.tier == 0 else -1.0)
@@ -313,28 +386,35 @@ class DiscoveryPlanner:
             if best is None:
                 return self._deep_request(want_organic) if self.tier >= 3 else []
             cp, cg, text = best
-            key = self._cell_key(cp, cg)
-            self.used.add(key)
-            self.qmap[text.lower()] = (cp, cg)
-            self.cells_issued += 1
-            reqs = []
-            # each cell: Places and/or organic, whichever the measured
-            # valid-records-per-credit justifies (never neither)
-            do_places = self.places and (want_places or not want_organic)
-            if do_places:
-                self.used.add(f"{key}#p1")
-                reqs.append(SearchRequest("places", text, 1, cp, cg, best_e))
-            elif self.places:
-                self.places_skipped += 1
-            if want_organic or not do_places:
-                self.used.add(f"{key}#o1")
-                reqs.append(SearchRequest("organic", text, 1, cp, cg, best_e))
-            else:
-                self.organic_skipped += 1
-            for r in reqs:
-                self._inflight(r, +1)
-                self.kissued[r.kind] = self.kissued.get(r.kind, 0) + 1
-            return reqs
+            return self._issue_cell(cp, cg, text, best_e, want_organic, want_places)
+
+    def _issue_cell(self, cp: str, cg: str, text: str, best_e: float,
+                    want_organic: bool, want_places: bool) -> list[SearchRequest]:
+        """Requests for one unused cell (lock held)."""
+        key = self._cell_key(cp, cg)
+        self.used.add(key)
+        self.qmap[text.lower()] = (cp, cg)
+        self.cells_issued += 1
+        reqs = []
+        # each cell: Places and/or organic, whichever the measured
+        # valid-records-per-credit justifies (never neither)
+        if key in self.organic_only:       # operators: Places ignores them
+            want_places, want_organic = False, True
+        do_places = self.places and (want_places or not want_organic)
+        if do_places:
+            self.used.add(f"{key}#p1")
+            reqs.append(SearchRequest("places", text, 1, cp, cg, best_e))
+        elif self.places:
+            self.places_skipped += 1
+        if want_organic or not do_places:
+            self.used.add(f"{key}#o1")
+            reqs.append(SearchRequest("organic", text, 1, cp, cg, best_e))
+        else:
+            self.organic_skipped += 1
+        for r in reqs:
+            self._inflight(r, +1)
+            self.kissued[r.kind] = self.kissued.get(r.kind, 0) + 1
+        return reqs
 
     def issued(self, kind: str) -> int:
         """Requests of this kind issued so far (this run + earlier runs'
@@ -369,6 +449,8 @@ class DiscoveryPlanner:
             if cell is None and len(self.cells) < CELLS_MEMORY_MAX:
                 cell = self.cells[ck] = {"q": req.query, "p": req.phrase, "g": req.geo,
                                          "new": 0, "pp": 0, "pn": 0, "op": 0, "on": 0}
+                if ck in self.organic_only:   # remembered for later runs' deep tier
+                    cell["oo"] = 1
             if cell is not None:
                 cell["new"] += new
                 pk, nk = ("pp", "pn") if req.kind == "places" else ("op", "on")
@@ -426,6 +508,23 @@ class DiscoveryPlanner:
         with self.lock:
             self._inflight(req, -1)
             self._release_fu(req)
+
+    def on_unsent(self, req: SearchRequest):
+        """The request was issued but never sent (the target was reached or
+        the user stopped while it waited): release it AND hand its search back,
+        so a later run of this location (a higher target, a resume) can still
+        send it. Marked used, it was lost for good - and recording it as an
+        empty page told the deep tier the result list had ended."""
+        with self.lock:
+            self._inflight(req, -1)
+            self._release_fu(req)
+            tag = "p" if req.kind == "places" else "o"
+            ck = self._cell_key(req.phrase, req.geo)
+            self.used.discard(f"{ck}#{tag}{req.page}")
+            if req.page == 1 and not req.meta.get("deep") \
+                    and f"{ck}#p1" not in self.used and f"{ck}#o1" not in self.used:
+                self.used.discard(ck)
+                self.qmap.pop(req.query.lower(), None)
 
     def on_failed(self, req: SearchRequest, error: str = "", retries: int = 2) -> str:
         """A search failed after the provider's own retries. Re-queue it with
@@ -494,16 +593,26 @@ class DiscoveryPlanner:
     def _deep_request(self, want_organic: bool) -> list[SearchRequest]:
         """Deep tier (lock held): the next result page of the cell with the
         most new businesses whose previous page was full (a short page means
-        the list ended)."""
-        best, best_new = None, 0
+        the list ended). Cells whose pages so far held only businesses found
+        by other phrases come last but still count: in one city every phrase's
+        first page lists the same popular firms, and the others are on the
+        pages after it - skipping those cells ended city searches at ~2/3 of
+        the target with full result lists still unread. Such a cell gets ONE
+        more page per search type (a probe); only if that finds new
+        businesses does it go deeper like any productive cell."""
+        best, best_new = None, -1
         for ck, c in self.cells.items():
             if c.get("new", 0) <= best_new:
                 continue
+            probe = c.get("new", 0) == 0
+            omax = (CUSTOM_ORGANIC_MAX_PAGE if ck in self.fixed_keys
+                    else DEEP_ORGANIC_MAX_PAGE)
             nxt = None
-            if self.places and c["pp"] == 0 and f"{ck}#p1" not in self.used:
+            places = self.places and not (c.get("oo") or ck in self.organic_only)
+            if places and c["pp"] == 0 and f"{ck}#p1" not in self.used:
                 # a productive cell only ever searched organically
                 nxt = ("places", 1, f"{ck}#p1")
-            elif (self.places and 1 <= c["pp"] < DEEP_PLACES_MAX_PAGE
+            elif (places and 1 <= c["pp"] < (2 if probe else DEEP_PLACES_MAX_PAGE)
                     and c["pn"] >= FOLLOWUP_MIN_RESULTS
                     and f"{ck}#p{c['pp'] + 1}" not in self.used):
                 nxt = ("places", c["pp"] + 1, f"{ck}#p{c['pp'] + 1}")
@@ -511,7 +620,8 @@ class DiscoveryPlanner:
                 # a productive cell only ever searched on Places: its organic
                 # results are a genuinely different result set
                 nxt = ("organic", 1, f"{ck}#o1")
-            elif (want_organic or not self.places) and 1 <= c["op"] < DEEP_ORGANIC_MAX_PAGE \
+            elif (want_organic or not places) \
+                    and 1 <= c["op"] < (2 if probe else omax) \
                     and c["on"] >= 8 and f"{ck}#o{c['op'] + 1}" not in self.used:
                 nxt = ("organic", c["op"] + 1, f"{ck}#o{c['op'] + 1}")
             if nxt:
@@ -540,14 +650,16 @@ class DiscoveryPlanner:
 
     def candidate_cells(self) -> int:
         with self.lock:
-            return sum(1 for cp, _ in self.phrases for cg, _ in self.geos
-                       if self._cell_key(cp, cg) not in self.used)
+            cells = {self._cell_key(cp, cg) for cp, _ in self.phrases for cg, _ in self.geos}
+            cells.update(self._cell_key(cp, cg) for cp, cg, _ in self.fixed)
+            return sum(1 for k in cells if k not in self.used)
 
     def summary(self) -> dict:
         with self.lock:
             top = sorted(self.pstat.items(), key=lambda kv: -kv[1][2])[:5]
             return {
                 "phrases": len(self.phrases), "locations": len(self.geos),
+                "custom_queries": len(self.fixed),
                 "cells_issued": self.cells_issued,
                 "rephrasings_dropped": self.dropped_rephrasings,
                 "followups_queued": len(self.followups),

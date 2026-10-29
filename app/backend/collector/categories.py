@@ -179,6 +179,35 @@ def parse_keywords(text: str, limit: int = 25, max_len: int = 80) -> list[str]:
     return out
 
 
+def parse_custom_queries(text: str, limit: int = 5, max_len: int = 300) -> list[str]:
+    """The custom search query box -> distinct Google queries, ONE PER LINE
+    (commas are part of a query: "dentists in Austin, TX"). Spacing is
+    normalized, duplicates (any case) dropped, order kept; operators and
+    quotes are left exactly as typed."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in (text or "").splitlines():
+        q = " ".join(line.split())[:max_len].strip()
+        if q and q.casefold() not in seen:
+            seen.add(q.casefold())
+            out.append(q)
+        if len(out) >= limit:
+            break
+    return out
+
+
+_OPERATOR_TOKEN = re.compile(
+    r'(?:^|(?<=\s))-(?:"[^"]*"|\S+)|\b[a-z]+:\S*|\bOR\b|\bAND\b', re.I)
+
+
+def query_terms(queries: list[str]) -> list[str]:
+    """Relevance terms from custom queries, like keyword_terms(): operator
+    tokens (site:..., OR) are dropped so "site linkedin com" never counts as
+    a match, and so are exclusions (-india, -"real estate"): an excluded
+    word is the opposite of a relevant one."""
+    return keyword_terms([_OPERATOR_TOKEN.sub(" ", q) for q in queries])
+
+
 def keyword_terms(keywords: list[str]) -> list[str]:
     """Relevance terms from the user's keywords: each whole phrase, plus its
     meaningful words (so "business development executive" also matches a

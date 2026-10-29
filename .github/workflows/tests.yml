@@ -33,6 +33,7 @@ jobs:
       - run: python tests/test_concurrency.py
       - run: python tests/test_credits.py
       - run: python tests/test_pipeline.py
+      - run: python tests/test_custom_query.py
       - run: python tests/test_performance.py
       - run: python tests/test_resilience.py
       - run: python tests/test_emailcheck.py
@@ -40,6 +41,7 @@ jobs:
       - run: python tests/test_bugfix_credits.py
       - run: python tests/test_bugfix_pipeline.py
       - run: python tests/test_bugfix_extract.py
+      - run: python tests/test_bugfix_scrape_counts.py
 
   windows-smoke:
     # the smoke test drives a real server and kills its worker (Windows

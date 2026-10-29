@@ -131,7 +131,8 @@ class JobManager:
     def submit(self, client: str, category: str, keywords: list[str], location: str,
                target: int, provider: str, max_queries: int, geo: dict | None = None,
                job_id: str | None = None, ip: str = "",
-               serper_key: str = "") -> CollectionJob:
+               serper_key: str = "",
+               custom_queries: list[str] | None = None) -> CollectionJob:
         with self.lock:
             mine = [j for j in self.jobs.values()
                     if j.owner == client and j.status in ACTIVE_STATUSES]
@@ -160,8 +161,9 @@ class JobManager:
                 raise JobRejected(503, "The server is at capacity (too many "
                                        "collections waiting). Try again in a few "
                                        "minutes.")
+            extra = {"custom_queries": custom_queries} if custom_queries else {}
             job = self.job_factory(self.state_for(client), category, keywords, location,
-                                   target, provider, max_queries, geo=geo)
+                                   target, provider, max_queries, geo=geo, **extra)
             if job_id:
                 job.id = job_id
             job.ip = ip
