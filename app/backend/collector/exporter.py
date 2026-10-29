@@ -311,6 +311,27 @@ def read_data_rows(path: str) -> list[tuple]:
         wb.close()
 
 
+def section_row_counts(path: str) -> dict[str, int]:
+    """Record rows per location heading of a category workbook (all sheets;
+    rows above any heading count under ""). The headings are the searched
+    locations, so this is what each search actually exported."""
+    from openpyxl import load_workbook
+    wb = load_workbook(path, read_only=True)
+    out: dict[str, int] = {}
+    try:
+        for ws in wb.worksheets:
+            section = ""
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                first = row[0] if row else None
+                if isinstance(first, str) and first.startswith(SECTION_PREFIX):
+                    section = first[len(SECTION_PREFIX):].rsplit("   (", 1)[0]
+                elif is_data_row(row):
+                    out[section] = out.get(section, 0) + 1
+    finally:
+        wb.close()
+    return out
+
+
 SUMMARY_COLS = [
     "Category", "Records Found", "Unique Records", "Records With Website",
     "Records With Email", "Records With Phone", "Records With Address",

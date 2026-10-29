@@ -50,14 +50,14 @@ from urllib.parse import urlparse
 from .. import config, fastjson
 from . import analysis, emailcheck
 from .categories import (CATEGORIES, cities_for, custom_terms, expansion_phrases, keyword_terms,
-                         search_phrases, slugify_custom)
+                         query_terms, search_phrases, slugify_custom)
 from .crawler import Fetcher, social_profile
 from .credits import CreditLedger, ledger_key
 from .deduplicator import DedupRegistry
-from .discovery import TIER_HELP, DiscoveryPlanner, SearchRequest
-from .exporter import read_data_rows, write_category_file, write_master_summary
+from .discovery import TIER_HELP, DiscoveryPlanner, SearchRequest, norm_query
+from .exporter import section_row_counts, write_category_file, write_master_summary
 from .extractor import Extracted, clean_emails, find_emails, split_address
-from .geo import expansion_geos, find_state, nearby_geos, state_of_city
+from .geo import country_code, expansion_geos, find_state, nearby_geos, state_of_city
 from .prio_pool import PriorityThreadPool
 from .normalize import clean_text, norm_domain, norm_name
 from .search import ProviderDisabled, account_limits, make_provider
@@ -66,6 +66,20 @@ from .validator import confidence, is_aggregator, is_skip_domain, record_status,
 log = logging.getLogger("engine")
 
 LIST_PAGE_MIN_EXTERNAL_LINKS = 12
+# Personal mailbox providers: an address there names no company website.
+FREE_MAIL_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "hotmail.com",
+    "outlook.com", "live.com", "msn.com", "aol.com", "icloud.com", "me.com",
+    "mac.com", "protonmail.com", "proton.me", "gmx.com", "gmx.net", "mail.com",
+    "yandex.com", "yandex.ru", "zoho.com", "comcast.net", "att.net",
+    "verizon.net", "sbcglobal.net", "bellsouth.net", "cox.net", "rediffmail.com",
+    "qq.com", "163.com"})
+
+
+def _free_mail(domain: str) -> bool:
+    """gmail.com, yahoo.co.uk, hotmail.fr ... (country variants included)."""
+    return domain in FREE_MAIL_DOMAINS or domain.split(".", 1)[0] in (
+        "gmail", "yahoo", "hotmail", "outlook", "live", "aol", "gmx", "yandex")
 CRAWLED_MEMORY_MAX = 60_000   # persisted crawl-attempt keys
 SLOW_START = 4                # searches in flight until yield is measured
 SEARCH_FAIL_STREAK = 3        # consecutive failed searches -> RECOVERING + pause
@@ -90,6 +104,17 @@ TERMINAL_STATUSES = ("completed", "stopped", "exhausted", "failed")
 # links together 12%. The pool is saturated on a small host, so the
 # high-yield work goes first and the target is reached with fewer crawls.
 PRIO_PLACE, PRIO_RESULT, PRIO_MINED = 0, 1, 2
+
+
+def _transient(reason: str) -> bool:
+    """A fetch failure that may well succeed on another day (timeouts,
+    network / DNS errors, 5xx / 429, an unreachable robots.txt), unlike an
+    SSRF block, a 4xx, a bad certificate or a non-HTML page."""
+    r = reason or ""
+    if r.startswith("HTTP "):
+        return r[5:8].isdigit() and (r[5] == "5" or r[5:8] in ("408", "429"))
+    return r.startswith(("timeout", "connection/DNS error", "request error",
+                         "unexpected error", "robots.txt disallows (or host unreachable)"))
 
 
 class JobFailed(Exception):
@@ -471,6 +496,14 @@ class StateStore:
             self.touch(slug)
         return removed, is_custom, fname
 
+    def unmark_crawled(self, key: str):
+        """Forget a crawl attempt that produced nothing final - the record was
+        refused only because the search's target was already full, or the
+        site failed transiently - so a later search (a higher target, another
+        city) may crawl it again instead of skipping it forever."""
+        with self.lock:
+            self.crawled.pop(key, None)
+
     def mark_crawled(self, key: str, slug: str) -> bool:
         """Atomically claim a crawl target. False if it was attempted before
         (this run or any earlier run)."""
@@ -568,10 +601,19 @@ class StateStore:
 class CollectionJob:
     def __init__(self, state: StateStore, category: str, keywords: list[str],
                  location: str, target: int, provider_name: str, max_queries: int,
-                 geo: dict | None = None):
+                 geo: dict | None = None, custom_queries: list[str] | None = None):
         self.state = state
         self.category = category
         self.keywords = [k.strip() for k in keywords if k.strip()]
+        # The user's own Google queries, searched exactly as typed and before
+        # anything else. Alone (no keywords) they are the WHOLE search; with
+        # keywords the usual keyword x location plan follows them.
+        self.custom_queries = [q.strip() for q in custom_queries or [] if q.strip()]
+        self.custom_only = bool(self.custom_queries) and not self.keywords
+        self._custom_keys = {norm_query(q) for q in self.custom_queries}
+        # crawl key -> (emails, Google result URL): business emails Google
+        # showed in a custom query's result snippets (see _snippet_hints)
+        self._snippet_emails: dict[str, tuple[list[str], str]] = {}
         self.location = location
         self.geo = {k: (geo or {}).get(k, "").strip() for k in ("city", "state", "country")}
         self.search_place = self._search_place()
@@ -584,6 +626,7 @@ class CollectionJob:
         else:  # user-defined custom category (registered in the state store)
             self.display = state.custom[category]["display"]
             self.terms = custom_terms(self.display, self.keywords)
+        self.terms += [t for t in query_terms(self.custom_queries) if t not in self.terms]
         self.target = max(1, min(target, config.MAX_TARGET))
         self.provider_name = provider_name
         # max_queries = size of the INITIAL plan the user sees; when those
@@ -612,11 +655,14 @@ class CollectionJob:
         self.extra_geos = (nearby_geos(self.geo["city"], self.geo["state"],
                                        self.geo["country"])
                            if config.SEARCH_NEARBY_CITIES else [])
+        if self.custom_only:   # only the user's queries: no generated searches
+            self.phrases, self.extra_phrases, self.geos, self.extra_geos = [], [], [], []
         # This search's records / planner memory are its location's own: an
         # earlier search elsewhere in the category is never counted toward
         # the target, resumed, or re-run.
         self.loc_key = StateStore.location_key(self.search_place["Search Location"])
         self.memory_key = f"{category}@@{self.loc_key}"
+        self.start_count = 0             # this location's records when the run began
 
         # pending|running|recovering|completed|stopped|exhausted|failed
         self.status = "pending"
@@ -628,6 +674,10 @@ class CollectionJob:
         self.counters = {
             "queries_executed": 0, "discovered": 0, "valid": 0,
             "duplicates": 0, "failed": 0, "emails": 0, "phones": 0,
+            # candidates that failed validation / were valid and new but
+            # arrived after this location's target was already full; Excel
+            # rows under this location's heading (set when the run ends)
+            "rejected": 0, "over_target": 0, "exported": 0,
             "websites": 0, "search_requests": 0, "serper_credits": 0,
             "serper_429": 0, "serper_timeouts": 0, "cache_hits": 0,
             "serper_ok": 0, "serper_failed": 0, "places_followups": 0,
@@ -635,6 +685,7 @@ class CollectionJob:
             "search_results": 0, "new_results": 0, "skipped_known": 0,
             "searches_done": 0,
             "social_lookups": 0, "social_emails": 0,
+            "snippet_sites": 0, "snippet_emails": 0,
             # fault tolerance
             "search_failures": 0, "search_retries": 0, "searches_failed": 0,
             "worker_errors": 0, "abandoned_tasks": 0, "pool_restarts": 0,
@@ -882,7 +933,10 @@ class CollectionJob:
 
     def _try_add(self, record: dict) -> bool:
         """Validate + dedup + store one candidate record."""
-        if self._closed:
+        ck = record.pop("_ck", "")   # crawl-memory key of the site behind it
+        if self._closed:   # crawl finished after the run ended: not stored
+            if ck:
+                self.state.unmark_crawled(ck)
             return False
         self._bump("discovered")
         with self.state.lock:
@@ -894,6 +948,7 @@ class CollectionJob:
             record["Record Status"] = record_status(record)
         self.timings.add("validate", time.perf_counter() - t0)
         if not ok:
+            self._bump("rejected")
             self.say(f"Rejected: {record.get('Company Name', '?')[:50]} ({reason})")
             return False
         kind = "places" if "_cid" in record else "organic"
@@ -912,6 +967,9 @@ class CollectionJob:
         self.timings.add("dedup", time.perf_counter() - t0)
         if not added:
             if not dup_of:   # target already full: not stored, not registered
+                self._bump("over_target")
+                if ck:
+                    self.state.unmark_crawled(ck)
                 return False
             self._bump("duplicates")
             with self.state.lock:
@@ -1094,6 +1152,11 @@ class CollectionJob:
         elif city:
             state_ = state_of_city(city, country)
         label = ", ".join(p for p in (city, state_, country) if p) or self.location.strip()
+        if not label and self.custom_queries:
+            # no location: the query is the search's own heading (and target)
+            more = len(self.custom_queries) - 1
+            label = f"Custom search: {self.custom_queries[0][:80]}" + (
+                f" (+{more} more)" if more else "")
         return {"Search Location": label or "Location not specified",
                 "Search State": state_, "Search Country": country or self.location.strip()}
 
@@ -1146,6 +1209,8 @@ class CollectionJob:
             url, extract=not skip, contact_links=not skip, mine=allow_mining)
         if res is None:
             self._note_failure(url, reason)
+            if _transient(reason):   # this run won't retry it; a later one may
+                self.state.unmark_crawled(self._crawl_key(url))
             return []
 
         candidates: list[str] = []
@@ -1187,6 +1252,12 @@ class CollectionJob:
                 if data.email and data.phone and data.address:
                     break
 
+        if not data.email:   # an email Google showed for it (custom query)
+            hint = self._snippet_hint(url, final_url)
+            if hint:
+                data.email, email_source = hint
+                self._bump("snippet_emails")
+
         if not data.email and socials:
             emails, page = self._social_email(socials[:3], data.name or norm_domain(final_url))
             if emails:
@@ -1211,6 +1282,7 @@ class CollectionJob:
             "Source URL": url,
             "Source Page": source_page,
             "_lk": lk,
+            "_ck": self._crawl_key(url),
         }
         self._try_add(record)
         return candidates
@@ -1230,14 +1302,19 @@ class CollectionJob:
         services = industry
         site_url = ""
         source_page = ""
+        crawl_key = ""
         if website.lower().startswith("http") and not is_skip_domain(website):
             p = urlparse(website)
             site_url = f"{p.scheme}://{p.netloc.lower()}"
             if not self._mark_attempted(website):
+                crawl_key = self._crawl_key(website)
                 self.say(f"Crawling: {site_url[:90]}")
                 res, final_url, reason = self._fetch_analyze(site_url)
                 if res is None:
                     self._note_failure(site_url, reason)
+                    if _transient(reason):
+                        self.state.unmark_crawled(crawl_key)
+                        crawl_key = ""
                 else:
                     if not res.get("blocked"):
                         data = self._to_extracted(res)
@@ -1282,6 +1359,7 @@ class CollectionJob:
             "Source Page": source_page,
             "_cid": cid,
             "_lk": lk,
+            "_ck": crawl_key,
         }
         self._try_add(record)
 
@@ -1477,6 +1555,76 @@ class CollectionJob:
             self._submit_crawl(u, req.query, True, lk)
         return new
 
+    def _snippet_hints(self, req: SearchRequest) -> list[str]:
+        """A custom query's organic page (just paid for): read the emails
+        Google shows in each result's title / snippet. Contact-pattern
+        queries ("email" "info" site:linkedin.com) are written to surface
+        them. Each email is kept as a hint for crawling that result's site,
+        used only if the site itself shows no email. A result on a social /
+        directory / gov page (never crawled as a company) that shows a
+        BUSINESS-domain email points at that business: its domain is
+        returned as a company website to crawl - the record is still built
+        only from that site and passes the usual validation. Free-mail
+        addresses (gmail ...) name no website, so they only count as hints."""
+        if norm_query(req.query) not in self._custom_keys:
+            return []
+        items = getattr(self.provider, "last_items", None) or []
+        sites: list[str] = []
+        for it in items:
+            link = str(it.get("link") or "")
+            if not link.startswith("http"):
+                continue
+            text = " ".join(str(it.get(k) or "") for k in ("title", "snippet"))
+            attrs = it.get("attributes")
+            if isinstance(attrs, dict):
+                text += " " + " ".join(str(v) for v in attrs.values())
+            emails = clean_emails(find_emails(text[:5000]))
+            if not emails:
+                continue
+            with self.lock:
+                if not is_skip_domain(link):
+                    # only the site's own (or a free-mail) address: a list
+                    # page's snippet may show another firm's email
+                    own = norm_domain(link)
+                    mine = [e for e in emails
+                            if _free_mail(d := e.rpartition("@")[2])
+                            or d == own or own.endswith("." + d)]
+                    if mine:
+                        self._snippet_emails.setdefault(self._crawl_key(link),
+                                                        (mine, link))
+                    continue
+                for e in emails:
+                    dom = e.rpartition("@")[2]
+                    site = f"https://{dom}"
+                    if _free_mail(dom) or is_skip_domain(site):
+                        continue
+                    self._snippet_emails.setdefault(
+                        self._crawl_key(site),
+                        ([x for x in emails if x.endswith("@" + dom)], link))
+                    if site not in sites:
+                        sites.append(site)
+        return sites
+
+    def _process_snippet_sites(self, sites: list[str], req: SearchRequest,
+                               lk: str = "") -> int:
+        new = 0
+        for site in sites:
+            if not self._claim_result(self._crawl_key(site)):
+                self._bump("skipped_known")
+                continue
+            new += 1
+            self._bump("snippet_sites")
+            self._submit_crawl(site, req.query, False, lk)
+        return new
+
+    def _snippet_hint(self, *urls: str) -> tuple[list[str], str] | None:
+        with self.lock:
+            for u in urls:
+                hint = self._snippet_emails.pop(self._crawl_key(u), None)
+                if hint:
+                    return hint
+        return None
+
     def _process_places(self, places: list[dict], req: SearchRequest, lk: str = "") -> int:
         new = 0
         for p in places:
@@ -1512,7 +1660,7 @@ class CollectionJob:
         backoff (bounded), a failing result-processing step is logged and
         skipped. Only ProviderDisabled (auth / credits gone) propagates."""
         if self.done():
-            self.planner.on_skipped(req)
+            self.planner.on_unsent(req)
             return
         attempt = int(req.meta.get("attempt", 0))
         label = (f"{req.kind}" if req.page == 1 else f"{req.kind} page {req.page}")
@@ -1563,9 +1711,15 @@ class CollectionJob:
                 self._recovering("search", f"search worker: {streak} Serper requests "
                                  f"failed in a row ({err[:60]}); retrying with backoff")
             return
-        if source in ("target", "executed"):
-            # nothing was sent: release the request (no yield to learn from)
-            self.planner.on_result(req, 0, 0, credits=0)
+        if source == "target":
+            # never sent: hand the search back for a later run of this location
+            self.planner.on_unsent(req)
+            return
+        if source == "executed":
+            # paid for in an earlier run: release it, but leave that run's
+            # page memory alone (recording 0 results here marked the cell's
+            # result list as ended, so the deep tier never read on)
+            self.planner.on_skipped(req)
             return
         with self.lock:
             self._search_fail_streak = 0
@@ -1589,7 +1743,10 @@ class CollectionJob:
             if req.kind == "places":
                 new = self._process_places(results, req, lk)
             else:
+                # snippet hints first: the crawls submitted below may start at once
+                sites = self._snippet_hints(req) if source == "api" else []
                 new = self._process_organic(results, req, lk)
+                new += self._process_snippet_sites(sites, req, lk)
         except Exception as exc:   # one bad result set never kills the job
             self._worker_error({"op": f"process_{req.kind}_results",
                                 "query": req.query, "url": ""}, exc)
@@ -1794,7 +1951,8 @@ class CollectionJob:
         return DiscoveryPlanner(
             self.phrases, self.geos, saved=saved, legacy_done=legacy,
             places=self.provider.supports_places, max_page=config.PLACES_MAX_PAGE,
-            extra_phrases=self.extra_phrases, extra_geos=self.extra_geos)
+            extra_phrases=self.extra_phrases, extra_geos=self.extra_geos,
+            fixed_queries=self.custom_queries)
 
     def _run(self):
         self.status = "running"
@@ -1808,6 +1966,15 @@ class CollectionJob:
                                           own_key or config.serper_api_key())
             if own_key:      # a user's own key is never swapped for app/.env's
                 self.provider.follow_env = False
+            # Google searches from the searched country (Serper defaults to
+            # the US): "law firms in Noida, Uttar Pradesh, India" with gl=us
+            # returns fewer local firms than the same search from India
+            gl = country_code(self.geo["country"]
+                              or self.location.rpartition(",")[2].strip())
+            if gl and hasattr(self.provider, "gl"):
+                self.provider.gl = gl
+                self.say(f"Search location: {self.search_place['Search Location']} "
+                         f"(Google country gl={gl})")
             if hasattr(self.provider, "on_event"):
                 def _ev(kind: str):
                     if kind == "429":
@@ -1819,12 +1986,20 @@ class CollectionJob:
             self._preflight_credits()
             self.say(f"Job started: {self.display} | target {self.target} | "
                      f"provider {self.provider_name} | "
-                     f"{len(self.planner.phrases)} search phrases x "
+                     + (f"{len(self.planner.fixed)} custom quer"
+                        f"{'y' if len(self.planner.fixed) == 1 else 'ies'} + "
+                        if self.planner.fixed else "")
+                     + f"{len(self.planner.phrases)} search phrases x "
                      f"{len(self.planner.geos)} locations "
                      f"({self.planner.candidate_cells()} unused searches, "
                      f"{self.planner.dropped_rephrasings} trivial rephrasings "
                      f"dropped) | credit budget {self.credit_budget}")
-            if self.category_count() > 0:
+            self.start_count = self.category_count()
+            if self.start_count >= self.target:
+                self.say(f"This location already has {self.start_count} records from "
+                         f"earlier searches - the target of {self.target} is met, so "
+                         f"nothing new is searched. Raise the target to collect more.")
+            elif self.category_count() > 0:
                 self.say(f"Resuming: {self.category_count()}/{self.target} records "
                          f"already collected for {self.search_place['Search Location']}; "
                          f"{self.planner.pending_retries()} previously failed "
@@ -1873,30 +2048,37 @@ class CollectionJob:
         Returns "" (target reached / stopped), "exhausted" or "budget"."""
         searches: dict = {}   # future -> SearchRequest
         errors = 0
-        while not self.done():
-            try:
-                reason = self._control_step(spool, searches)
-                if errors:
-                    errors = 0
-                    self._recovered("controller", "controller loop healthy again")
-                if reason:
-                    return reason
-            except (ProviderDisabled, JobFailed):
-                raise
-            except Exception as exc:
-                errors += 1
-                self._bump("controller_errors")
-                log.exception("controller loop error %d/%d", errors,
-                              config.MAX_CONTROLLER_ERRORS)
-                if errors >= config.MAX_CONTROLLER_ERRORS:
-                    raise JobFailed(
-                        f"collection controller failed {errors} times in a row; "
-                        f"last error {type(exc).__name__}: {exc}") from exc
-                self._recovering("controller", f"controller error {type(exc).__name__}: "
-                                 f"{str(exc)[:80]} (retry {errors}/"
-                                 f"{config.MAX_CONTROLLER_ERRORS})")
-                time.sleep(min(10.0, 0.25 * 2 ** errors))
-        return ""
+        try:
+            while not self.done():
+                try:
+                    reason = self._control_step(spool, searches)
+                    if errors:
+                        errors = 0
+                        self._recovered("controller", "controller loop healthy again")
+                    if reason:
+                        return reason
+                except (ProviderDisabled, JobFailed):
+                    raise
+                except Exception as exc:
+                    errors += 1
+                    self._bump("controller_errors")
+                    log.exception("controller loop error %d/%d", errors,
+                                  config.MAX_CONTROLLER_ERRORS)
+                    if errors >= config.MAX_CONTROLLER_ERRORS:
+                        raise JobFailed(
+                            f"collection controller failed {errors} times in a row; "
+                            f"last error {type(exc).__name__}: {exc}") from exc
+                    self._recovering("controller", f"controller error {type(exc).__name__}: "
+                                     f"{str(exc)[:80]} (retry {errors}/"
+                                     f"{config.MAX_CONTROLLER_ERRORS})")
+                    time.sleep(min(10.0, 0.25 * 2 ** errors))
+            return ""
+        finally:
+            # searches still queued when the run ends were never sent: a
+            # later run of this location may still need them
+            for f, req in list(searches.items()):
+                if f.cancel():
+                    self.planner.on_unsent(req)
 
     def _control_step(self, spool: ThreadPoolExecutor, searches: dict) -> str:
         # 1. harvest finished searches (_search_task isolates its own errors;
@@ -1939,7 +2121,7 @@ class CollectionJob:
                 try:
                     searches[spool.submit(self._search_task, r)] = r
                 except RuntimeError:   # search pool shutting down
-                    self.planner.on_skipped(r)
+                    self.planner.on_unsent(r)
         # 3. watchdog: stuck tasks, stalled stages, strategy refresh
         self._watchdog(searches)
         # 4. terminal only when nothing is in flight and nothing is left
@@ -2092,12 +2274,15 @@ class CollectionJob:
         summary = self._finalize_outputs()
         n = self.category_count()
         credits = self.counters["serper_credits"]
+        loc = self.search_place["Search Location"]
         if n >= self.target:
             self.status = "completed"
             self.stop_reason = "target reached"
-            self.say(f"Target reached: {n} of {self.target} valid unique records in "
-                     f"{round(time.time() - t0)}s using {credits} Serper credits. "
-                     f"{summary} Status: COMPLETED.")
+            earlier = (f" ({self.start_count} of them from earlier searches of "
+                       f"this location)" if self.start_count else "")
+            self.say(f"Target reached: {n} of {self.target} valid unique records for "
+                     f"{loc}{earlier} in {round(time.time() - t0)}s using {credits} "
+                     f"Serper credits. {summary} Status: COMPLETED.")
         elif self.stop_event.is_set():
             self.status = "stopped"
             self.stop_reason = "stopped by user"
@@ -2114,14 +2299,39 @@ class CollectionJob:
                     f"MAX_CREDITS_PER_RECORD in app/.env (0 = no cap) and start "
                     f"again to continue.")
             else:
-                self.stop_reason = (
-                    "every search strategy tier is used up (base, relaxed, "
-                    "expanded phrases + nearby locations, deep result pages) - "
-                    "the remaining search space returns only companies already "
-                    "found. Add keywords or broaden the location to continue.")
-            self.say(f"Could only find {n} of {self.target} genuine valid companies: "
-                     f"{self.stop_reason} {summary}")
+                self.stop_reason = self._shortfall_reason() + " " + (
+                    "Add another custom query or keywords to continue."
+                    if self.custom_only else
+                    "Add keywords or broaden the location to continue.")
+            self.say(f"Could only find {n} of {self.target} genuine valid companies "
+                     f"for {loc}: {self.stop_reason} {summary}")
         self._save_job_meta()
+
+    def _shortfall_reason(self) -> str:
+        """Why the search space ran out, from what actually happened this run
+        (the old fixed text blamed duplicates even when Google returned
+        nothing at all)."""
+        with self.lock:
+            c = dict(self.counters)
+        tiers = ("base, relaxed, expanded phrases"
+                 + (" + nearby locations" if self.extra_geos else "") + ", deep result pages")
+        head = f"every search strategy tier is used up ({tiers})"
+        searched, results = c["searches_done"], c["search_results"]
+        skipped = c["skipped_executed"]
+        if not searched:
+            return (f"{head} - every search for this location was already run by an "
+                    f"earlier collection ({self.start_count} records were collected "
+                    f"then; {skipped} repeated searches skipped, no credit spent).")
+        if not results:
+            return (f"{head} - the {searched} search(es) sent returned no results at "
+                    f"all: Google lists nothing for them here.")
+        if not c["new_results"]:
+            return (f"{head} - all {results} search results were businesses already "
+                    f"collected (by this location, another location or category).")
+        return (f"{head} - {searched} searches returned {results} results, "
+                f"{c['new_results']} of them not collected before: {c['valid']} stored, "
+                f"{c['duplicates']} duplicates, {c['rejected']} rejected (not a company "
+                f"or no contact details), {c['failed']} sites failed to load.")
 
     def _finalize_outputs(self) -> str:
         with self.state.lock:
@@ -2142,37 +2352,52 @@ class CollectionJob:
             log.warning("final dedup check: %d duplicate domain(s), %d duplicate "
                         "name(s) among %d records", dup_dom, dup_name, len(recs))
         self.checkpoint(force=True)
+        mine = [r for r in recs
+                if StateStore.location_key(r.get("Search Location", "")) == self.loc_key]
         export_note = ""
         for attempt in range(2):
             try:
                 if attempt:   # checkpoint(force=True) above already exported;
                     # the file on disk disagrees, so rewrite it regardless
                     self.state.export_categories([self.category], force=True)
-                rows = self._excel_rows()
-                if rows == len(recs):
-                    export_note = f"Excel verified: {rows} rows."
+                rows, loc_rows = self._excel_rows()
+                self.counters["exported"] = loc_rows
+                if rows == len(recs) and loc_rows == len(mine):
+                    export_note = (f"Excel verified: {loc_rows} rows exported under "
+                                   f"'{self.search_place['Search Location']}' "
+                                   f"({rows} rows in the file).")
                     break
-                export_note = (f"Excel row count {rows} != {len(recs)} records "
-                               f"(re-exporting)")
+                export_note = (f"Excel row count {rows} != {len(recs)} records or "
+                               f"{loc_rows} != {len(mine)} for this location (re-exporting)")
+                log.warning("final export check: %s", export_note)
             except Exception as exc:   # e.g. file open in Excel
                 export_note = (f"Excel export failed ({type(exc).__name__}: "
                                f"{str(exc)[:60]}) - close the file and restart to "
                                f"regenerate; all records are saved in the checkpoint.")
                 log.warning("final export attempt %d failed: %s", attempt + 1, exc)
-        emails = sum(1 for r in recs if r.get("Business Email"))
-        phones = sum(1 for r in recs if r.get("Business Phone"))
-        sites = sum(1 for r in recs if r.get("Official Website"))
-        return (f"Valid unique: {len(recs)}, duplicates removed: "
-                f"{self.counters['duplicates']}, emails: {emails}, phones: {phones}, "
-                f"websites: {sites}; final dedup check: {dup_dom} duplicate domains, "
+        c = self.counters
+        emails = sum(1 for r in mine if r.get("Business Email"))
+        phones = sum(1 for r in mine if r.get("Business Phone"))
+        sites = sum(1 for r in mine if r.get("Official Website"))
+        return (f"Counts for this location: requested {self.target}, collected "
+                f"{len(mine)} ({c['valid']} new this run); this run discovered "
+                f"{c['discovered']} candidates: {c['valid']} valid, {c['duplicates']} "
+                f"duplicates, {c['rejected']} rejected, {c['over_target']} not needed "
+                f"(target already full), {c['failed']} sites failed to load. With "
+                f"email {emails}, phone {phones}, website {sites}. Category total "
+                f"{len(recs)} records; final dedup check: {dup_dom} duplicate domains, "
                 f"{dup_name} duplicate names. {export_note}")
 
-    def _excel_rows(self) -> int:
-        """Record rows in the category's workbook (every state sheet; the
-        location headings are not counted)."""
+    def _excel_rows(self) -> tuple[int, int]:
+        """(record rows in the category's workbook - every state sheet, the
+        location headings not counted -, rows under this search's own
+        location heading)."""
         path = os.path.join(self.state.out_dir,
                             self.state.all_categories()[self.category]["file"])
-        return len(read_data_rows(path))
+        sections = section_row_counts(path)
+        return (sum(sections.values()),
+                sum(n for h, n in sections.items()
+                    if StateStore.location_key(h) == self.loc_key))
 
     def _fail(self, message: str, error: str):
         """FAILED: genuinely unrecoverable; the exact reason is logged."""
@@ -2192,6 +2417,7 @@ class CollectionJob:
     def _job_meta(self) -> dict:
         return {"target": self.target, "status": self.status,
                 "collected": self.category_count(), "keywords": self.keywords,
+                "custom_queries": self.custom_queries,
                 "location": self.location, "geo": dict(self.geo),
                 "started_at": self.started_at,
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -2360,6 +2586,7 @@ class CollectionJob:
             "category": self.category,
             "category_display": self.display,
             "keywords": self.keywords,
+            "custom_queries": self.custom_queries,
             "location": self.location,
             "target": self.target,
             "provider": self.provider_name,

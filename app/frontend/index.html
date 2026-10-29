@@ -109,12 +109,13 @@
   label { display: block; font-size: 12.5px; color: var(--ink-2); font-weight: 600;
           margin: 0 0 6px; }
   label small { font-weight: 400; color: var(--ink-3); }
-  input, select {
+  input, select, textarea {
     width: 100%; padding: 11px 14px; border: 1.5px solid var(--border-strong);
     border-radius: var(--radius-sm); background: var(--surface); color: var(--ink);
     font-size: 14.5px; font-family: inherit; transition: border-color .15s, box-shadow .15s;
   }
-  input:focus, select:focus { outline: none; border-color: var(--accent);
+  textarea { resize: vertical; min-height: 44px; line-height: 1.45; }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent);
                               box-shadow: 0 0 0 3px var(--accent-soft); }
   .loc-row { display: grid; grid-template-columns: 1.3fr 1fr 1fr; gap: 10px; }
   @media (max-width: 620px) { .loc-row { grid-template-columns: 1fr; } }
@@ -302,7 +303,7 @@
   @media (max-width: 620px) {
     body { font-size: 14.5px; }
     /* 16px inputs stop iOS Safari from zooming in on focus */
-    input, select { font-size: 16px; padding: 12px 14px; }
+    input, select, textarea { font-size: 16px; padding: 12px 14px; }
     .search-wrap input { font-size: 16px; }
     .brand-name { font-size: 15px; }
     .brand-sub { display: none; }
@@ -631,6 +632,12 @@
     <input id="keywords" placeholder="e.g. CPA, Tax, Business development executive">
     <div class="estimate" id="kwHint"></div>
     <div id="kwChips" class="chips"></div>
+
+    <div class="gap"></div>
+    <div class="step"><span class="n">4</span> Custom search query <span style="font-weight:400;color:var(--ink-3)">&mdash; optional</span></div>
+    <textarea id="customQuery" rows="2" maxlength="2000" spellcheck="false"
+              placeholder="e.g. accounting firms in Texas&#10;or: site:.com/contact consulting &quot;Chicago&quot; email -intitle:accounting"></textarea>
+    <div class="estimate" id="cqHint"></div>
 
     <details class="adv">
       <summary><svg class="chev" width="13" height="13" viewBox="0 0 24 24"><use href="#i-chev"/></svg>
@@ -1530,8 +1537,10 @@ async function init() {
   recordsPerCredit = cfg.defaults.records_per_credit || 2.5;
   socialLookup = cfg.defaults.social_email_lookup !== false;
   maxKeywords = cfg.defaults.max_keywords || 25;
+  maxCustomQueries = cfg.defaults.max_custom_queries || 5;
   dailyLimit = cfg.defaults.daily_credit_limit || 0;
   updateKeywordHint();
+  updateCustomQueryHint();
   const tlist = $('targetList');
   tlist.innerHTML = '';
   (cfg.defaults.target_choices || [20, 50, 100, 250, 500, 1000, 1500, 2000]).forEach(v => {
@@ -1676,7 +1685,7 @@ $('keyRemove').onclick = async () => {
 };
 
 let maxTarget = 2000, maxCreditsPerRecord = 1.5, recordsPerCredit = 2.5, socialLookup = true;
-let maxKeywords = 25, dailyLimit = 0;
+let maxKeywords = 25, maxCustomQueries = 5, dailyLimit = 0;
 // The typed number of records (any positive whole number), or 0
 function typedTarget() {
   const t = Number($('target').value);
@@ -1742,6 +1751,30 @@ function updateKeywordHint() {
     ? `${kws.length} keyword${kws.length === 1 ? '' : 's'}: ` + kws.map(k => `"${k}"`).join(', ')
     : 'Separate keywords with commas. A phrase like "business development executive" stays one keyword.';
 }
+// The custom query box -> Google queries, one per line, split like the
+// server does (commas belong to the query: "dentists in Austin, TX").
+function parseCustomQueries(text) {
+  const seen = new Set(), out = [];
+  (text || '').split(/\r?\n/).forEach(l => {
+    const q = l.split(/\s+/).join(' ').trim().slice(0, 300).trim();
+    if (q && !seen.has(q.toLowerCase())) { seen.add(q.toLowerCase()); out.push(q); }
+  });
+  return out.slice(0, maxCustomQueries);
+}
+function updateCustomQueryHint() {
+  const qs = parseCustomQueries($('customQuery').value);
+  const kws = parseKeywords($('keywords').value);
+  $('cqHint').textContent = !qs.length
+    ? `Searched on Google exactly as typed, operators included ("quotes", site:, inurl:, ` +
+      `intitle:, OR, -word). One query per line, up to ${maxCustomQueries}.`
+    : `${qs.length} custom quer${qs.length === 1 ? 'y' : 'ies'}, searched exactly as typed. ` +
+      (kws.length
+        ? 'They run first, then the keyword searches for the location above.'
+        : 'Only these queries are searched (add keywords to also run the usual ' +
+          'keyword + location searches). Country / state / city, if set, only ' +
+          'name the Excel sheet and heading (country also picks Google\'s search ' +
+          'country); put locations in the query itself, e.g. "Yuma AZ".');
+}
 // Scale the query budget with the target (unless the user set it manually)
 // so a 100-record search doesn't run out of queries at 76 records.
 let maxqManual = false;
@@ -1754,7 +1787,8 @@ $('target').addEventListener('input', () => {
   updateEstimate();
 });
 $('country').addEventListener('input', updateStateList);
-$('keywords').addEventListener('input', () => { renderChips(); updateKeywordHint(); });
+$('keywords').addEventListener('input', () => { renderChips(); updateKeywordHint(); updateCustomQueryHint(); });
+$('customQuery').addEventListener('input', updateCustomQueryHint);
 
 /* ---------- start / stop ---------- */
 $('start').onclick = async () => {
@@ -1780,6 +1814,7 @@ $('start').onclick = async () => {
         category: isCustom ? '__custom__' : selectedCat,
         custom_category: $('customName').value,
         keywords: $('keywords').value,
+        custom_query: $('customQuery').value,
         country: $('country').value, state: $('state').value, city: $('city').value,
         target: targetValue(),
         provider: $('provider').value, max_queries: +$('maxq').value,

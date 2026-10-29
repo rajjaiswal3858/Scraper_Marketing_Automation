@@ -238,7 +238,8 @@ class Worker:
     def cmd_collect(self, client: str, category: str, custom_category: str,
                     keywords: list[str], location: str, geo: dict, target: int,
                     provider: str, max_queries: int, job_id: str | None = None,
-                    ip: str = "", serper_key: str = ""):
+                    ip: str = "", serper_key: str = "",
+                    custom_queries: list[str] | None = None):
         state = self.stores.get(client)
         created = ""
         if category == "__custom__":
@@ -260,7 +261,8 @@ class Worker:
         try:
             job = self.manager.submit(client, category, keywords, location, target,
                                       provider, max_queries, geo=geo, job_id=job_id,
-                                      ip=ip, serper_key=serper_key)
+                                      ip=ip, serper_key=serper_key,
+                                      custom_queries=custom_queries)
         except Exception:
             # a rejected collection (busy / limit / capacity) leaves no
             # empty custom category behind

@@ -48,7 +48,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from . import auth, config, db, fastjson, keys, persist
-from .collector.categories import SUMMARY_FILE, parse_keywords
+from .collector.categories import SUMMARY_FILE, parse_custom_queries, parse_keywords
 from .hub import RpcError, WorkerHub, WorkerUnavailable
 
 ACTIVE = ("queued", "pending", "running", "recovering", "waiting")
@@ -442,6 +442,7 @@ async def h_config(scope, headers, client) -> Reply:
                      "max_target": config.MAX_TARGET,
                      "target_choices": config.TARGET_CHOICES,
                      "max_keywords": config.MAX_KEYWORDS,
+                     "max_custom_queries": config.MAX_CUSTOM_QUERIES,
                      "daily_credit_limit": config.MAX_CREDITS_PER_IP_PER_DAY,
                      "max_queries": config.DEFAULT_MAX_QUERIES,
                      "credits_per_query": 1 + config.PLACES_PAGES_PER_QUERY,
@@ -907,6 +908,7 @@ class CollectRequest(BaseModel):
     category: str = Field(max_length=80)   # fixed/custom slug, or "__custom__"
     custom_category: str = Field(default="", max_length=60)
     keywords: str = Field(default="", max_length=1000)
+    custom_query: str = Field(default="", max_length=2000)   # one Google query per line
     country: str = Field(default="", max_length=60)
     state: str = Field(default="", max_length=60)   # state / region
     city: str = Field(default="", max_length=60)
@@ -1020,6 +1022,9 @@ async def start_collect(req: CollectRequest, request: Request):
             "custom_category": req.custom_category,
             "keywords": parse_keywords(req.keywords, config.MAX_KEYWORDS,
                                        config.MAX_KEYWORD_LEN),
+            "custom_queries": parse_custom_queries(req.custom_query,
+                                                   config.MAX_CUSTOM_QUERIES,
+                                                   config.MAX_CUSTOM_QUERY_LEN),
             "location": location, "geo": geo, "target": req.target,
             "provider": req.provider, "max_queries": req.max_queries,
             "ip": ip_of(request), "serper_key": own_key}

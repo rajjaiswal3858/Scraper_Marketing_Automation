@@ -181,6 +181,9 @@ class SerperProvider(SearchProvider):
         self.retry_count = 0
         self.disabled_kind = ""
         self.disabled_reason = ""
+        # Google country of the job's searches (ISO code, e.g. "in"); "" =
+        # Serper's default (US). Set per job - each job has its own provider.
+        self.gl = ""
         self.lock = threading.Lock()
         self.on_event = None   # optional callable("429"|"timeout"|"retry")
         # timeouts of the calling thread's last request (credit ledger: a
@@ -197,6 +200,26 @@ class SerperProvider(SearchProvider):
         reported for the answer plus 1 per timed-out attempt (it may have
         been billed server-side)."""
         return getattr(self._tl, "credits", 1)
+
+    @property
+    def last_items(self) -> list[dict]:
+        """Full organic results (title, link, snippet, ...) of the calling
+        thread's last organic() / organic_page() request; [] after a failure."""
+        return list(getattr(self._tl, "items", None) or [])
+
+    def _organic_urls(self, payload: dict) -> list[str]:
+        """One organic page: its result URLs, and its full items kept for
+        last_items. The query goes in the JSON body exactly as given."""
+        self._tl.items = []
+        data = self._post(self.SEARCH_URL, payload)
+        items = [i for i in data.get("organic") or [] if isinstance(i, dict)]
+        self._tl.items = items
+        urls: list[str] = []
+        for item in items:
+            link = item.get("link") or ""
+            if link.startswith("http") and link not in urls:
+                urls.append(link)
+        return urls
 
     def _event(self, kind: str):
         if self.on_event is not None:
@@ -263,6 +286,8 @@ class SerperProvider(SearchProvider):
         is logged with query, timing, status and result count."""
         if self.disabled_reason:
             raise ProviderDisabled(self.disabled_reason, self.disabled_kind)
+        if self.gl and "gl" not in payload:
+            payload = {**payload, "gl": self.gl}
         last, retry_after = "", 0.0
         attempts = config.SERPER_MAX_ATTEMPTS
         self._tl.timeouts = 0
@@ -356,13 +381,7 @@ class SerperProvider(SearchProvider):
         """Exactly ONE credit: a single page of up to 10 results. (The old
         loop silently paid for page 2 and 3 whenever Google returned fewer
         than 10 organic links, e.g. when a local pack took space.)"""
-        data = self._post(self.SEARCH_URL, {"q": query, "num": 10})
-        urls: list[str] = []
-        for item in data.get("organic") or []:
-            link = item.get("link") or ""
-            if link.startswith("http") and link not in urls:
-                urls.append(link)
-        return urls[:max_results]
+        return self._organic_urls({"q": query, "num": 10})[:max_results]
 
     def organic_items(self, query: str) -> list[dict]:
         """One page of full organic results (title, link, snippet, ...) -
@@ -407,13 +426,7 @@ class SerperProvider(SearchProvider):
         """Organic results page N (1 credit). Used by the deep-search tier."""
         if page <= 1:
             return self.organic(query, 10)
-        data = self._post(self.SEARCH_URL, {"q": query, "num": 10, "page": page})
-        urls: list[str] = []
-        for item in data.get("organic") or []:
-            link = item.get("link") or ""
-            if link.startswith("http") and link not in urls:
-                urls.append(link)
-        return urls
+        return self._organic_urls({"q": query, "num": 10, "page": page})
 
     def places_page(self, query: str, page: int) -> list[dict]:
         data = self._post(self.PLACES_URL, {"q": query, "page": page})

@@ -85,7 +85,8 @@ STATE_CITIES: dict[str, dict[str, list[str]]] = {
         "Telangana": ["Hyderabad", "Secunderabad", "Warangal"],
         "Delhi": ["New Delhi", "Delhi"],
         "Haryana": ["Gurgaon", "Faridabad", "Panchkula"],
-        "Uttar Pradesh": ["Noida", "Lucknow", "Ghaziabad", "Kanpur", "Varanasi"],
+        "Uttar Pradesh": ["Noida", "Lucknow", "Ghaziabad", "Kanpur", "Varanasi",
+                          "Prayagraj", "Agra", "Meerut"],
         "Gujarat": ["Ahmedabad", "Surat", "Vadodara", "Rajkot", "Gandhinagar"],
         "West Bengal": ["Kolkata", "Howrah", "Siliguri"],
         "Rajasthan": ["Jaipur", "Udaipur", "Jodhpur"],
@@ -154,6 +155,23 @@ def _country_key(country: str) -> str:
     from .categories import _COUNTRY_ALIASES
     key = " ".join((country or "").lower().split())
     return _COUNTRY_ALIASES.get(key, key)
+
+
+GOOGLE_COUNTRY = {
+    "usa": "us", "india": "in", "uk": "gb", "canada": "ca", "australia": "au",
+    "uae": "ae", "germany": "de", "france": "fr", "spain": "es", "italy": "it",
+    "netherlands": "nl", "ireland": "ie", "singapore": "sg", "new zealand": "nz",
+    "south africa": "za", "saudi arabia": "sa", "qatar": "qa", "pakistan": "pk",
+    "bangladesh": "bd", "nepal": "np", "sri lanka": "lk", "malaysia": "my",
+    "philippines": "ph", "indonesia": "id", "japan": "jp", "brazil": "br",
+    "mexico": "mx",
+}
+
+
+def country_code(country: str) -> str:
+    """Google's country code (Serper `gl`) for a typed country, "" if unknown.
+    Without it Serper searches as from the US, whatever the query names."""
+    return GOOGLE_COUNTRY.get(_country_key(country), "")
 
 
 def find_state(state: str, country: str) -> tuple[str, str, list[str]]:

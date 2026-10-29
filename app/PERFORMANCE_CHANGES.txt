@@ -59,7 +59,7 @@ TOP 3 BOTTLENECKS
   ~3-4 s; it is Serper's response time, not something the app can cut.)
 
 =============================================================================
-CHANGE #1
+CHANGE #1:
 Problem:        32 crawl threads analysed HTML at once on <= 1 CPU; GIL and
                 cache contention made each page cost 2-3x more CPU.
 File changed:   app/backend/config.py, app/backend/collector/analysis.py
