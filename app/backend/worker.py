@@ -187,7 +187,8 @@ class Worker:
             summary = m.summary()
             active = [{"category": j.category, "display": j.display,
                        "status": j.status, "collected": j.category_count(),
-                       "target": j.target}
+                       "target": j.target,
+                       "owner": j.owner}       # stripped by the API
                       for j in list(m.active.values()) + [m.jobs[k] for k in m.queue]]
         jobs, logs = {}, {}
         for j in live:
