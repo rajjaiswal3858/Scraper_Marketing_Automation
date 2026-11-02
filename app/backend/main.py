@@ -454,6 +454,44 @@ async def h_config(scope, headers, client) -> Reply:
     })
 
 
+# Admins' collections are private: other users never see what they search
+# for. Owners (identity ids) of admin accounts, refreshed once a minute.
+_admin_owners: set[str] = set()
+_admin_owners_at = 0.0
+_admin_owners_ok = False
+
+
+async def admin_owners() -> set[str] | None:
+    """Identity ids of the admin accounts; None when unknown (lookup failed),
+    so the caller hides everything rather than risk leaking an admin's job."""
+    global _admin_owners_at, _admin_owners_ok
+    if not auth.enabled() or not config.admin_emails():
+        return set()
+    if time.monotonic() - _admin_owners_at > 60:
+        _admin_owners_at = time.monotonic()
+        try:
+            users = await auth.list_users()
+            _admin_owners.update(auth.identity(u["id"]) for u in users
+                                 if auth.is_admin(u.get("email", "")))
+            _admin_owners_ok = True
+        except Exception:
+            logging.getLogger("api").warning("admin list unavailable", exc_info=True)
+    return _admin_owners if _admin_owners_ok else None
+
+
+async def visible_active_jobs(client: str) -> list:
+    """The running / queued collections a caller may see: everyone's except
+    an admin's (only that admin sees their own). Owner ids are removed."""
+    admins = await admin_owners()
+    out = []
+    for a in hub.active:
+        owner = a.get("owner")
+        if owner != client and (admins is None or owner in admins):
+            continue
+        out.append({k: v for k, v in a.items() if k != "owner"})
+    return out
+
+
 async def h_status(scope, headers, client) -> Reply:
     """The caller's own collection (with live-log lines after `log_after`
     of job `log_job`), the caller's own per-category counts and the shared
@@ -473,7 +511,7 @@ async def h_status(scope, headers, client) -> Reply:
         "job": job,
         "per_category": cats,
         "queue": hub.queue,
-        "active_jobs": hub.active,
+        "active_jobs": await visible_active_jobs(client),
         "poll_ms": config.POLL_MS_ACTIVE if active else config.POLL_MS_IDLE,
     })
 
@@ -678,6 +716,8 @@ class Guard:
             if user is not None:
                 who = auth.identity(user["id"])
                 auth.last_seen[user["id"]] = time.time()
+                if user.get("is_admin"):     # private from their first request
+                    _admin_owners.add(who)
             elif bad is None:
                 bad = (401, "Please log in", ((b"x-login-required", b"1"),))
         scope["bdc"] = (who, ip)          # for the FastAPI endpoints
